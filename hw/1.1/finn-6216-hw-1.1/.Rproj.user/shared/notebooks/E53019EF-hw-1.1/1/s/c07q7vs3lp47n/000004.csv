@@ -1,0 +1,7 @@
+"0","aapl_abs_dg_numerical %>%
+  left_join(spy_abs) %>%
+  mutate(portf_delta_p = shares_spy * spy_delta_p + options_appl * delta_p) %>%
+  na.omit()
+"
+"2","Joining, by = ""date""
+"

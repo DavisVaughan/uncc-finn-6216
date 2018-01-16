@@ -1,0 +1,2 @@
+"0","portf_rel_grid <- join_and_weight(aapl_rel_grid, spy_abs, options_appl, shares_spy)"
+"0","select(portf_rel_grid, date, portf_delta_p)"

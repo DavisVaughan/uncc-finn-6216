@@ -1,0 +1,4 @@
+"0","aapl_rel_full_reeval <- aapl_rel %>%"
+"0","  mutate(shifted_current_close = current_close_aapl + delta_close,"
+"0","         shifted_option_value  = put_option_pricer(shifted_current_close, k, r, y, time_to_expiry, sigma),"
+"0","         delta_p               = shifted_option_value - current_option_value)"

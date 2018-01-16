@@ -1,0 +1,2 @@
+"0","portf_abs_grid <- join_and_weight(aapl_abs_grid, spy_abs, options_appl, shares_spy)"
+"0","select(portf_abs_grid, date, portf_delta_p)"

@@ -1,0 +1,2 @@
+"0","# Here is delta / gamma  / delta_p"
+"0","select(aapl_rel_dg_numerical, date, delta_numerical, gamma_numerical, delta_p)"

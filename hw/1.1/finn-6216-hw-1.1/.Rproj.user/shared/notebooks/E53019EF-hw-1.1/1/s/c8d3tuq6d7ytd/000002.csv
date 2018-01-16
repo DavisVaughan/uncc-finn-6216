@@ -1,0 +1,7 @@
+"0","# 97th percentile on 503 values"
+"0","percentile_97 <- round((nrow(aapl) - 1) * 0.03)"
+"0","percentile_97"
+"1","[1]"
+"1"," 15"
+"1","
+"

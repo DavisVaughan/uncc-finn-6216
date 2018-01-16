@@ -1,0 +1,2 @@
+"0","portf_rel_dg_analytical <- join_and_weight(aapl_rel_dg_analytical, spy_rel, options_appl, shares_spy)"
+"0","select(portf_rel_dg_analytical, date, portf_delta_p)"
