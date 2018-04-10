@@ -1,0 +1,419 @@
+---
+title: "HW6"
+author: "Davis Vaughan"
+date: "3/5/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Required packages
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(mvtnorm)
+library(purrr)
+library(readr)
+library(tidyr)
+options(pillar.sigfig = 6)
+```
+
+# Get data
+
+```{r}
+portfolio <- c("AAPL", "SPY")
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+# library(tidyquant)
+# portfolio_raw  <- tq_get(portfolio,  from = start_date, to = end_date, get = "stock.prices.google")
+# write_rds(portfolio_raw, "portfolio_raw.rds")
+portfolio_raw <- read_rds("portfolio_raw.rds")
+```
+
+# Question 2
+
+### Relative shifts
+
+```{r}
+portfolio_shifts <- portfolio_raw %>%
+  group_by(symbol) %>%
+  mutate(delta_X = close / lag(close) - 1) %>%
+  select(symbol, date, delta_X) %>%
+  spread(symbol, delta_X) %>%
+  na.omit()
+
+portfolio_shifts
+```
+
+### Function for Empirical CDF
+
+$$ \hat{F}_n(t) = \frac{1}{n} \sum_{i = 1}^{n}{1_{x_i \le t}} $$
+
+```{r}
+cdf_empirical <- function(x) {
+  rank(x) / length(x)
+}
+```
+
+Here are the plots of the CDF's to prove that this works
+
+```{r}
+plot(portfolio_shifts$AAPL, cdf_empirical(portfolio_shifts$AAPL))
+plot(portfolio_shifts$SPY,  cdf_empirical(portfolio_shifts$SPY))
+```
+
+### Function for Gaussian Copula
+
+```{r}
+gaussian_copula_mvtnorm <- function(u1, u2, rho) {
+
+  # Function that integrates the bivariate normal PDF
+  # in a way that calculates the joint CDF.
+  integrate_bivariate_normal <- function(x, y) {
+    pmvnorm(lower = c(-Inf, -Inf),
+            upper = c(x, y),
+            corr  = matrix(c(1, rho, rho, 1), nrow = 2))
+  } 
+  
+  # This actually calculates the copula
+  # Phi_p (Phi^-1 (u1), Phi^-1 (u2))
+  integrate_bivariate_normal(qnorm(u1), qnorm(u2))
+}
+```
+
+### Function for Joint CDF from gaussian copula
+
+```{r}
+joint_cdf <- function(x, y, rho)  {
+  cdf_x <- cdf_empirical(x)
+  cdf_y <- cdf_empirical(y)
+  map2_dbl(cdf_x, cdf_y, gaussian_copula_mvtnorm, rho = rho)
+}
+```
+
+### Empirical correlation
+
+```{r}
+rho <- with(portfolio_shifts, cor(AAPL, SPY))
+rho
+```
+
+### Copula calculations to get the joint CDF
+
+Let's calculate each piece individually rather than using `joint_cdf()` so 
+you can see what is going on.
+
+```{r}
+portfolio_copula <- portfolio_shifts %>%
+  mutate(
+    F1_AAPL    = cdf_empirical(AAPL),
+    F2_SPY     = cdf_empirical(SPY),
+    joint_cdf  = map2_dbl(F1_AAPL, F2_SPY, gaussian_copula_mvtnorm, rho = rho)
+  )
+
+portfolio_copula
+```
+
+### Correlation comparison
+
+We want to verify that the correlation obtained from the copula is close to the
+empirical correlation.
+
+We need a function that can calculate the probability:
+
+$$ P(a \le x \le b , c \le y \le d) $$
+
+```{r}
+gaussian_copula_mvtnorm_box <- function(u1, u2, l1, l2, rho) {
+
+  integrate_bivariate_normal <- function(x_upper, y_upper, x_lower, y_lower) {
+    pmvnorm(lower = c(x_lower, y_lower),
+            upper = c(x_upper, y_upper),
+            corr  = matrix(c(1, rho, rho, 1), nrow = 2))
+  }
+
+  integrate_bivariate_normal(qnorm(u1), qnorm(u2), qnorm(l1), qnorm(l2))
+}
+```
+
+We also need a function to calculate E(XY).
+
+```{r}
+calc_E_XY <- function(x, y, rho) {
+  
+  x_sort <- sort(x)
+  y_sort <- sort(y)
+  
+  cdf_sorted_x <- cdf_empirical(x_sort)
+  cdf_sorted_y <- cdf_empirical(y_sort)
+  
+  e_product <- 0
+  sum_p     <- 0
+  
+  for(i in 2:503) {
+    
+    x_i   <- x_sort[i]
+    px_i  <- cdf_sorted_x[i]
+    px_i1 <- cdf_sorted_x[i-1]
+    
+    for(j in 2:503) {
+  
+      y_j   <- y_sort[j]
+      py_j  <- cdf_sorted_y[j]
+      py_j1 <- cdf_sorted_y[j-1]
+      
+      p <- gaussian_copula_mvtnorm_box(px_i, py_j, px_i1, py_j1, rho = rho)
+      
+      #http://www.maths.lth.se/matstat/kurser/mas213/riemannstieltjes.pdf
+      # page 11
+      # p <- gaussian_copula_mvtnorm(px_i,  py_j,  rho) - 
+      #      gaussian_copula_mvtnorm(px_i1, py_j,  rho) - 
+      #      gaussian_copula_mvtnorm(px_i,  py_j1, rho) + 
+      #      gaussian_copula_mvtnorm(px_i1, py_j1, rho)
+      
+      e_product <- e_product + x_i * y_j * p
+      sum_p     <- sum_p + p
+      
+    }
+    #print(paste("i = ", i))
+  }
+  
+  list(e_product = e_product[1], sum_p = sum_p[1])
+}
+```
+
+```{r}
+e_xy_list <- calc_E_XY(portfolio_shifts$AAPL, portfolio_shifts$SPY, rho)
+
+E_XY <- e_xy_list$e_product
+E_XY
+
+E_X  <- with(portfolio_shifts, mean(AAPL))
+E_Y  <- with(portfolio_shifts, mean(SPY))
+SD_X <- with(portfolio_shifts, sd(AAPL))
+SD_Y <- with(portfolio_shifts, sd(SPY))
+
+# Correlation of the distribution using the copula
+cor_distribution <- (E_XY - E_X * E_Y) / (SD_X * SD_Y)
+cor_distribution
+
+# VS rho
+rho
+
+# Also ensure that sum of the probabilities are ~1
+e_xy_list$sum_p
+```
+
+
+### Adjust the initial correlation
+
+You can adjust the correlation to get pretty darn close. Here we start with
+the correlations `0.6074579` and we get a final correlation of `0.5350656` which
+is very close to the `rho` of `0.5374579`. 
+
+```{r}
+rho_adjusted <- rho + .07
+
+e_xy_list_adjusted <- calc_E_XY(portfolio_shifts$AAPL, portfolio_shifts$SPY, rho_adjusted)
+
+# Correlation of the distribution using the copula
+(e_xy_list_adjusted$e_product - E_X * E_Y) / (SD_X * SD_Y)
+```
+
+# Question 3
+
+### Absolute shifts
+
+```{r}
+portfolio_abs_shifts <- portfolio_raw %>%
+  group_by(symbol) %>%
+  mutate(delta_X = close - lag(close)) %>%
+  select(symbol, date, delta_X) %>%
+  spread(symbol, delta_X) %>%
+  na.omit()
+
+portfolio_abs_shifts
+```
+
+### Optimize 1-D t distributions for each stock
+
+Hold the mean and variance constant and optimizing the likelihood based on 
+changing the `nu`.
+
+```{r}
+# Based on location scale distribution
+# https://www.mathworks.com/help/stats/t-location-scale-distribution.html
+t_dist_neg_log_lik <- function(nu, x) {
+  # Enforce a "known" mu and sigma. Only optimize for nu
+  sigma <- sqrt(var(x) * (nu - 2) / nu)
+  mu    <- mean(x)
+  likelihood <- gamma((nu + 1) / 2) / (sigma * sqrt(nu * pi) * gamma(nu / 2)) * 
+                (1 + ((x - mu) / sigma)^2 / nu) ^ (- (nu + 1) / 2)
+  
+  sum(-log(likelihood))
+}
+
+# Get the optimal nu value for each stock
+optimal_nu <- list(
+  AAPL = optimize(f        = t_dist_neg_log_lik, 
+                  interval = c(0, 10), 
+                  x        = portfolio_abs_shifts$AAPL)$minimum,
+  
+  SPY  = optimize(f        = t_dist_neg_log_lik, 
+                  interval = c(0, 10), 
+                  x        = portfolio_abs_shifts$SPY)$minimum
+)
+
+optimal_nu
+```
+
+### Simulate 10,000 random vectors
+
+```{r}
+set.seed(12345)
+
+n <- 10000
+
+# Correlation to use
+rho_abs <- with(portfolio_abs_shifts, cor(AAPL, SPY))
+rho_abs
+
+# Cholesky matrix
+corr_mat <- matrix(c(1, rho_abs, rho_abs, 1), nrow = 2)
+A <- t(chol(corr_mat))
+A
+
+# Correlated bivariate normals
+Z_std <- matrix(rnorm(2 * n), nrow = 2)
+Z <- t(A %*% Z_std)
+head(Z)
+
+# Get correlated uniform variables
+U <- pnorm(Z)
+
+# Use our optimal values of nu to convert to deltaX values for the t distribution
+delta_X_AAPL <- qt(U[,1], df = optimal_nu$AAPL)
+delta_X_SPY  <- qt(U[,2], df = optimal_nu$SPY)
+
+# See that rank correlation is preserved through the transformations
+cor(Z[,1], Z[,2], method = "spearman")
+cor(U[,1], U[,2], method = "spearman")
+cor(delta_X_AAPL, delta_X_SPY, method = "spearman")
+```
+
+### Put option pricing function
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+  
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+  
+  V
+}
+```
+
+### Applying the simulations
+
+Calculate the change in the portfolio value for each simulation
+
+```{r}
+# 100 shares of SPY
+shares_spy <- 100
+
+# 400 European put options on Apple
+options_appl   <- 400
+
+# Parameters
+time_to_expiry <- 1
+sigma          <- .25    # volatility
+k              <- 170    # strike
+r              <- .012   # risk free int rate
+y              <- .019   # div yield
+
+# Percentiles needed
+percentile_99 <- round(n * 0.01)
+percentile_97 <- round(n * 0.03)
+
+# Current prices and option values
+current_aapl_price  <- last(filter(portfolio_raw, symbol == "AAPL")$close)
+current_spy_price   <- last(filter(portfolio_raw, symbol == "SPY")$close)
+current_aapl_option <- put_option_pricer(current_aapl_price, k, r, y, time_to_expiry, sigma)
+
+# Calculate the change in each stock and the change in the portfolio
+portfolio_delta_p <- tibble(delta_X_AAPL, delta_X_SPY) %>%
+  mutate(
+    shifted_aapl_price  = current_aapl_price + delta_X_AAPL,
+    shifted_aapl_option = put_option_pricer(shifted_aapl_price, k, r, y, time_to_expiry, sigma),
+    delta_p_aapl        = shifted_aapl_option - current_aapl_option,
+    delta_p_spy         = delta_X_SPY,
+    delta_p             = shares_spy * delta_p_spy + options_appl * delta_p_aapl
+  )
+
+portfolio_delta_p
+```
+
+### 99% VaR
+
+```{r}
+portfolio_delta_p %>%
+  pull(delta_p) %>%
+  sort() %>%
+  .[percentile_99]
+```
+
+### 97% ES
+
+```{r}
+portfolio_delta_p %>%
+  pull(delta_p) %>%
+  sort() %>%
+  .[seq(percentile_97)] %>%
+  mean()
+```
+
+### Log likelihood for the joint density
+
+```{r}
+log_lik_gaussian_cop_with_t_marginals <- function(x, y, df_x, df_y, rho) {
+  cdf_matrix <- cbind(pt(x, df = df_x), pt(y, df = df_y))
+  inv_cdf_norm <- qnorm(cdf_matrix)
+  log_lik <- dmvnorm(inv_cdf_norm, mean = c(0,0), sigma = matrix(c(1,rho,rho,1), ncol = 2), log = TRUE)
+  sum(log_lik)
+}
+
+llh <- log_lik_gaussian_cop_with_t_marginals(
+  x    = portfolio_abs_shifts$AAPL,
+  y    = portfolio_abs_shifts$SPY, 
+  df_x = optimal_nu$AAPL, 
+  df_y = optimal_nu$SPY, 
+  rho  = rho
+)
+```
+
+We are doing the log likelihood. So "bigger", towards 0, is better. This table
+compares the model from this HW with the ones from HW 3. This model significantly
+outperforms the others!
+
+```{r}
+llh_comparison <- tribble(
+  ~model,              ~llh,
+  "dirty-t_nu",       -1657.373,
+  "dirty-t_nu+1",     -1663.675,
+  "dirty-t_nu-1",     -1650.319,
+  "EM algo",          -1667.551,
+  "Gauss cop, t marg", llh
+)
+
+arrange(llh_comparison, desc(llh))
+```
+
+The log likelihood for this model seems to be much better than the HW3 models!
+This would make sense as we allowed the individual stocks to be modeled by t 
+distributions with their own degrees of freedom parameters. 

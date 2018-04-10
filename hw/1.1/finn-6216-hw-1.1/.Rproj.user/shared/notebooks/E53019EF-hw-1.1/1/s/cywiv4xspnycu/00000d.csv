@@ -1,2 +1,0 @@
-"0","portf_abs_dg_numerical <- join_and_weight(aapl_abs_dg_numerical, spy_abs, options_appl, shares_spy)"
-"0","select(portf_abs_dg_numerical, date, portf_delta_p)"

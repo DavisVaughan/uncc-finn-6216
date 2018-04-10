@@ -1,0 +1,382 @@
+---
+title: "HW 3"
+author: "Davis Vaughan"
+date: "2/7/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+## Load required packages
+
+If you want to run the code, you will need the packages below. To install 
+them you would have to do the code that is commented out. If you have any
+questions, let me know!
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(tidyquant)
+options(pillar.sigfig = 6)
+
+# To install the above packages if you don't have them:
+# install.packages("dplyr")
+# install.packages("lubridate")
+# install.packages("devtools")
+# devtools::install_github("business-science/tidyquant")
+```
+
+## Initialize variables
+
+```{r}
+# Seed
+set.seed(1243)
+
+# 100 shares of SPY
+shares_spy <- 100
+
+# 400 European put options on Apple
+options_appl   <- 400
+time_to_expiry <- 1
+sigma          <- .25    # volatility
+k              <- 170    # strike
+r              <- .012   # risk free int rate
+y              <- .019   # div yield
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+```
+
+## Retrieve data
+
+Based on the HW notes, "most recent AAPL price of 175" implies that he used
+closing prices, because that is the only one that fits.
+
+```{r}
+spy  <- tq_get("SPY",  from = start_date, to = end_date, get = "stock.prices.google") %>% 
+  select(date, close) %>%
+  rename(spy_close = close)
+
+aapl <- tq_get("AAPL", from = start_date, to = end_date, get = "stock.prices.google") %>%
+  select(date, close)
+```
+
+## Black scholes pricing function
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+  
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+  
+  V
+}
+```
+
+Also important are the current value of Apple and SPY. And the current 
+value of the put option on Apple.
+
+```{r}
+# Current value of AAPL and SPY
+current_close_aapl <- last(aapl$close)
+current_close_spy  <- last(spy$spy_close)
+
+# Current put option value of AAPL
+current_option_value <- put_option_pricer(current_close_aapl, k , r, y, time_to_expiry, sigma)
+```
+
+## Calculate absolute differences
+
+Go ahead and calculate separate data frames for absolute differences
+of Apple and SPY. These will be useful to us later.
+
+```{r}
+# Apple absolute shifts
+aapl_abs <- aapl %>%
+  mutate(aapl_delta = close - lag(close)) %>%
+  na.omit()
+
+# Spy absolute shifts
+spy_abs <- spy %>%
+  mutate(spy_delta = spy_close - lag(spy_close)) %>%
+  na.omit()
+```
+
+# 1 - Dirty t distribution
+
+Kurtosis function
+
+```{r}
+# Sample kurtosis
+kurtosis <- function(x, na.rm = FALSE) {
+  
+  if(na.rm) {
+    x <- na.omit(x)
+  }
+  
+  n <- length(x)
+  
+  numerator   <-  sum( (x - mean(x)) ^ 4 ) / n
+  denominator <- (sum( (x - mean(x)) ^ 2 ) / n) ^ 2
+  
+  numerator / denominator
+}
+```
+
+Parameter setup
+
+```{r}
+# Setup portfolio matrix version for easy matrix calcs
+portf_mat <- left_join(aapl_abs, spy_abs, "date") %>%
+  select(aapl_delta, spy_delta) %>%
+  as.matrix()
+
+# Means and covariances
+mean_samp <- colMeans(portf_mat)
+cov_samp  <- cov(portf_mat)
+
+# Kurtosis and avg kurtosis
+kurt_samp <- c(aapl_delta = kurtosis(portf_mat[,"aapl_delta"]), 
+               spy_delta  = kurtosis(portf_mat[,"spy_delta"]))
+
+avg_kurt <- mean(kurt_samp)
+
+# Degrees of freedom by shortcut method
+nu <- (4 * avg_kurt - 6) / (avg_kurt - 3)
+
+# Number of reps
+n <- 5000
+percentile_99_n_sims <- .01 * n
+```
+
+Generate random numbers needed for the calculations
+
+These random numbers will be used for every nu VaR recalculation to be consistent.
+
+```{r}
+Z_std      <- matrix(c(rnorm(n), rnorm(n)), ncol = 2)
+unif_for_W <- runif(n)
+```
+
+Generate 5000 W values using this idea
+
+$$ 1 / X \sim IG(\alpha, \beta) $$
+
+Where:
+
+$$ X \sim Gamma(\alpha, \beta) $$
+
+We need a function that can calculate all of the required pieces to get VaR
+based on Monte Carlo simulation and Normal Mixture modeling.
+
+```{r}
+# Quick and dirty function for getting var
+calc_VaR <- function(nu, mean_samp, cov_samp, Z_std, unif_for_W, 
+                     current_close_aapl, current_option_value, 
+                     k, r, y, time_to_expiry, sigma, 
+                     percentile_99_n_sims, n) {
+  
+  # Get to delta_X shifts
+  cov_adjusted <- ((nu - 2) / nu) * cov_samp 
+  chol_adjusted <- t(chol(cov_adjusted))
+  Z <- t(chol_adjusted %*% t(Z_std))
+  
+  alpha <- nu / 2
+  beta  <- nu / 2
+  
+  W <- 1 / qgamma(unif_for_W, alpha, beta)
+  
+  delta_X <- mean_samp + sqrt(W) * Z
+  
+  # Recalculate portfolio values
+  portf_monte_carlo <- as.tibble(delta_X) %>%
+    mutate(
+      aapl_shifted_put_option = put_option_pricer(current_close_aapl + aapl_delta, k, r, y, time_to_expiry, sigma),
+      aapl_delta_p            = options_appl * (aapl_shifted_put_option - current_option_value),
+      spy_delta_p             = shares_spy * spy_delta,
+      delta_p                 = aapl_delta_p + spy_delta_p
+    )
+  
+  # Pull delta p, sort, and get VaR
+  portf_monte_carlo %>%
+    pull(delta_p) %>%
+    sort() %>%
+    .[percentile_99_n_sims] %>%
+    set_names("VaR")
+  
+}
+
+# Partially evaluate the calc_VaR function. All we will need to pass in will be varying nu
+calc_VaR_nu <- partial(calc_VaR, 
+      mean_samp = mean_samp, cov_samp = cov_samp, Z_std = Z_std, unif_for_W = unif_for_W,
+      current_close_aapl = current_close_aapl, current_option_value = current_option_value,
+      k = k, r = r, y = y, time_to_expiry = time_to_expiry, sigma = sigma,
+      percentile_99_n_sims = percentile_99_n_sims, n = n
+)
+```
+
+Shift the $\nu$ value up and down by 1 and calculate VaR for everything
+
+```{r}
+nu_up   <- nu + 1
+nu_down <- nu - 1
+
+# VaR for different nu values
+tibble(
+  VaR_nu_up   = calc_VaR_nu(nu_up),
+  VaR_nu      = calc_VaR_nu(nu),
+  VaR_nu_down = calc_VaR_nu(nu_down)
+)
+```
+
+
+```{r}
+log_lik_2d_t_dist <- function(x, y, nu, mu, variance) {
+  
+  p <- 2
+  shape_matrix <- variance * (nu - 2) / nu
+  location     <- mu
+  X            <- cbind(x,y)
+  
+  rowwise_scale <- function(row, nu, mu, cov) {
+    row <- matrix(row, ncol = 2)
+    (row - mu) %*% solve(cov) %*% t(row - mu)
+  }
+  
+  X_scaled <- apply(X, 1, rowwise_scale, nu = nu, mu = location, cov = shape_matrix)
+  
+  likelihood <- gamma((nu + p) / 2) / ((nu * pi) ^ (p / 2) * gamma(nu / 2) * sqrt(det(shape_matrix))) * 
+                (1 + X_scaled / nu) ^ (- (nu + p) / 2)
+  
+  sum(log(likelihood))
+} 
+
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu,      mu = mean_samp, variance = cov_samp)
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu_up,   mu = mean_samp, variance = cov_samp)
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu_down, mu = mean_samp, variance = cov_samp)
+```
+
+
+## Summary
+
+When compared with the HW2 Normal distributions, these heavy tailed results 
+all have more extreme VaR values so they are likely a better fit. Comparing
+to historical VaR values that ended up being around -670 or so, these are much
+closer than HW2's normal assumptions. 
+
+Technically if we are going off of the historical data being the "correct" answer,
+the `nu-1` result get's us closer. This is inconsistent with what the optimal 
+nu value ends up being, however, as the optimal value is higher around 7.5.
+
+# 2 - EM Algorithm
+
+```{r}
+em_algorithm <- function(portf_mat, nu_guess = 5) {
+  
+  epsilon <- 0.000001
+  
+  mu_k      <- colMeans(portf_mat)
+  cov_samp  <- cov(portf_mat)
+  cov_k     <- cov_samp
+  nu_k      <- nu_guess
+  
+  d <- ncol(portf_mat)
+  n <- nrow(portf_mat)
+  
+  # Need a function to apply beta calc to each X_i
+  rowwise_beta <- function(row, nu_k, mu_k, cov_k) {
+    row <- matrix(row, ncol = 2)
+    .5 * (nu_k + (row - mu_k) %*% solve(cov_k) %*% t(row - mu_k))
+  }
+  
+  # Minimize the neg log lik func
+  log_lik_fun <- function(nu, delta_k2, squiggle_k2) {
+    nu_2 <- nu / 2
+    
+    sum(nu_2 * log(nu_2) - nu_2 * delta_k2 - (nu_2 + 1) * squiggle_k2 - log(gamma(nu_2)))
+  }
+  
+  for(k in 1:1000) {
+    
+      alpha_k <- (nu_k + d) / 2
+      beta_k  <- apply(portf_mat, 1, rowwise_beta, nu_k, mu_k, cov_k)
+      
+      delta_k <- alpha_k / beta_k
+      delta_k_mean <- mean(delta_k)
+      
+      # Update mu
+      mu_k <- colSums(portf_mat * delta_k) / (n * delta_k_mean)
+      
+      psi <- matrix(
+        c(
+          # Doing it piecewise because the matrix mult doesn't work otherwise
+          sum((portf_mat[,1] - mu_k[1]) ^ 2 * delta_k),
+          sum((portf_mat[,1] - mu_k[1]) * (portf_mat[,2] - mu_k[2]) * delta_k),
+          sum((portf_mat[,1] - mu_k[1]) * (portf_mat[,2] - mu_k[2]) * delta_k),
+          sum((portf_mat[,2] - mu_k[2]) ^ 2 * delta_k)
+        ),
+        nrow = 2
+      ) / n
+      
+      # Update cov_k
+      cov_k <- det(cov_samp) ^ (1 / d) * psi / (det(psi) ^ (1/d))
+      
+      beta_k2 <- apply(portf_mat, 1, rowwise_beta, nu_k, mu_k, cov_k)
+      delta_k2 <- alpha_k / beta_k2
+      
+      squiggle_k2 <- ((gamma(alpha_k - epsilon) * beta_k2 ^ epsilon) / gamma(alpha_k) - 1) / epsilon
+      
+      nu_k_next <- optimise(log_lik_fun, lower = 1, upper = 100, delta_k2 = delta_k2, squiggle_k2 = squiggle_k2, maximum = TRUE)$maximum
+      
+      if(abs(nu_k_next - nu_k) <= 0.00001) {
+        optim_nu <- nu_k_next
+        break()
+      } else {
+        nu_k <- nu_k_next
+      }
+      
+      #message(paste("Finishing iteration", k, "with nu =", nu_k))
+  }
+  
+  dimnames(cov_k) <- list(c("aapl_delta", "spy_delta"), c("aapl_delta", "spy_delta"))
+  
+  list(mu = mu_k, cov_mat = cov_k, nu = optim_nu)
+}
+```
+
+Find the optimal parameters
+
+```{r}
+optimal_params <- em_algorithm(portf_mat, 5)
+optimal_params
+```
+
+Use those optimal params to calculate VaR.
+
+I think the notes are unclear as to whether you use the optimal mean and covariance
+matrix to recalculate VaR, or if you are supposed to use the original sample
+ones. Here I use the optimal as I felt that made more sense.
+
+```{r}
+calc_VaR(nu = optimal_params$nu, mean_samp = optimal_params$mu, cov_samp = optimal_params$cov_mat, 
+         Z_std, unif_for_W = unif_for_W, current_close_aapl, current_option_value, k, r, y, time_to_expiry, sigma, percentile_99_n_sims, n = n)
+```
+
+## Log like comparison
+
+```{r}
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu,      mu = mean_samp, variance = cov_samp)
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu_up,   mu = mean_samp, variance = cov_samp)
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = nu_down, mu = mean_samp, variance = cov_samp)
+log_lik_2d_t_dist(portf_mat[,1], portf_mat[,2], nu = optimal_params$nu, mu = optimal_params$mu, variance = optimal_params$cov_mat)
+```
+
+## Summary
+
+It is hard to 100% say whether this is a better fit than the others. The VaR
+value is not closer to historical values, even though we have done optimization
+to make it fit the data as close as possible.

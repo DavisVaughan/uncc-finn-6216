@@ -1,0 +1,181 @@
+---
+title: "HW 5"
+author: "Davis Vaughan"
+date: "2/22/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include=FALSE}
+# Inline hook to not display scientific notation
+inline_hook <- function(x) {
+  if (is.numeric(x)) {
+    format(x, digits = 2)
+  } else x
+}
+knitr::knit_hooks$set(inline = inline_hook)
+```
+
+
+# Required packages
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(tidyquant)
+options(pillar.sigfig = 6)
+
+# To install the above packages if you don't have them:
+# install.packages("dplyr")
+# install.packages("lubridate")
+# install.packages("devtools")
+# devtools::install_github("business-science/tidyquant")
+```
+
+# Question 3
+
+### Get the data
+
+```{r}
+position_per_stock <- 1000000
+num_factors <- 2
+stocks <- c("F", "GM", "IBM", "MSFT", "AAPL", "AMZN", "SPY", "XOM", "PFE", "BA")
+
+last_day <- as.Date("2018-02-02")
+first_day <- last_day - years(1)
+
+# stocks_raw <- tq_get(stocks, from = first_day, to = last_day)
+# write_rds(stocks_raw, "stocks_raw.rds")
+stocks_raw <- read_rds(path = "stocks_raw.rds")
+
+stocks_prices <- stocks_raw %>%
+  select(symbol, date, close)
+
+# All of the stocks are here in a "long" format
+# The symbol column specifies which row belongs to which stock
+head(stocks_prices)
+```
+
+### Compute relative shifts
+
+```{r}
+stocks_shifts <- stocks_prices %>%
+  
+  # For each ticker
+  group_by(symbol) %>%
+  
+  # Calculate the delta_X values
+  mutate(daily_return = close / lag(close) - 1,
+         delta_X  = daily_return * position_per_stock) %>%
+  
+  select(symbol, date, delta_X) %>%
+  ungroup() %>%
+  na.omit()
+
+head(stocks_shifts)
+```
+
+### PCA
+
+Spread the data and turn it into a matrix
+
+```{r}
+delta_X_wide <- stocks_shifts %>%
+  mutate(symbol = as_factor(symbol)) %>%
+  spread(symbol, delta_X) %>%
+  select(-date) %>%
+  as.matrix()
+
+head(delta_X_wide)
+```
+
+
+```{r}
+# Mean
+delta_X_mean <- colMeans(delta_X_wide)
+delta_X_mean
+
+# Covariance matrix
+cov(delta_X_wide - delta_X_mean)
+
+# PCA on the centered values
+pca <- princomp(delta_X_wide - delta_X_mean)
+
+# Extract the eigenvectors of the first 2 columns
+eigenvector <- pca$loadings
+eigenvector_reduced <- eigenvector[, 1:num_factors]
+
+# Summarise results
+pca_results <- tibble(
+  lambda = pca$sdev ^ 2,
+  prop_of_variance = lambda / sum(lambda),
+  cumulative_prop = cumsum(lambda) / sum(lambda)
+)
+
+pca_results
+```
+
+The loadings look like this:
+
+```{r}
+eigenvector
+```
+
+
+```{r, include=FALSE}
+pca_first_two_printable <- paste0(round(pca_results$cumulative_prop[num_factors] * 100, 2), "%")
+```
+
+For just the first two factors, `r pca_first_two_printable` of the variability is explained.
+
+### VaR with just two factors
+
+```{r}
+# Also calculate the 99th percentile number we will use for VaR
+percentile_99_VaR <- floor(nrow(delta_X_wide) * .01)
+percentile_99_VaR
+```
+
+
+```{r}
+# Calculate Y
+Y <- (delta_X_wide - delta_X_mean) %*% eigenvector_reduced
+head(Y)
+
+# Then use that to "predict" the in sample deltaX values
+delta_X_wide_predicted <- Y %*% t(eigenvector_reduced) + delta_X_mean
+head(delta_X_wide_predicted)
+
+# rowSum this to get portfolio values
+delta_P_pca <- rowSums(delta_X_wide_predicted)
+
+# Calc VaR
+VaR_pca <- delta_P_pca %>%
+  sort() %>%
+  .[percentile_99_VaR] %>%
+  set_names("VaR PCA Multi-Factor")
+
+VaR_pca
+```
+
+### VaR with full reevaluation
+
+```{r}
+# Just use all the stocks
+delta_P <- rowSums(delta_X_wide)
+
+# VaR
+VaR_full <- delta_P %>%
+  sort() %>%
+  .[percentile_99_VaR] %>%
+  set_names("VaR all stocks")
+
+VaR_full
+```
+
+### Summary
+
+The PCA estimate of `r VaR_pca[[1]]` get's pretty close to the VaR estimate from using all 
+10 stocks of `r VaR_full[[1]]`, however it does overestimate the VaR. Overall it does a good job, and I am impressed with
+how close it got with such few factors.

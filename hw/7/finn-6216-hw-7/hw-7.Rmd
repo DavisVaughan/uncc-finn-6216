@@ -1,0 +1,439 @@
+---
+title: "HW 7"
+author: "Davis Vaughan"
+date: "3/19/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Required packages
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(mvtnorm)
+library(purrr)
+library(readr)
+library(tidyr)
+options(pillar.sigfig = 6)
+```
+
+# Get data
+
+```{r}
+portfolio <- c("AAPL", "SPY")
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+# library(tidyquant)
+# portfolio_raw  <- tq_get(portfolio,  from = start_date, to = end_date, get = "stock.prices.google")
+# write_rds(portfolio_raw, "portfolio_raw.rds")
+portfolio_raw <- read_rds("portfolio_raw.rds")
+```
+
+# Question 1
+
+Before we speak on Kendall's tau and Spearman's rho, let's set up the distribution
+again.
+
+### Absolute shifts
+
+```{r}
+portfolio_abs_shifts <- portfolio_raw %>%
+  group_by(symbol) %>%
+  mutate(delta_X = close - lag(close)) %>%
+  select(symbol, date, delta_X) %>%
+  spread(symbol, delta_X) %>%
+  na.omit()
+
+portfolio_abs_shifts
+```
+
+### Optimize 1-D t distributions for each stock
+
+Hold the mean and variance constant and optimizing the likelihood based on 
+changing the `nu`.
+
+```{r}
+# Based on location scale distribution
+# https://www.mathworks.com/help/stats/t-location-scale-distribution.html
+t_dist_neg_log_lik <- function(nu, x) {
+  # Enforce a "known" mu and sigma. Only optimize for nu
+  sigma <- sqrt(var(x) * (nu - 2) / nu)
+  mu    <- mean(x)
+  likelihood <- gamma((nu + 1) / 2) / (sigma * sqrt(nu * pi) * gamma(nu / 2)) * 
+                (1 + ((x - mu) / sigma)^2 / nu) ^ (- (nu + 1) / 2)
+  
+  sum(-log(likelihood))
+}
+
+# Get the optimal nu value for each stock
+optimal_nu <- list(
+  AAPL = optimize(f        = t_dist_neg_log_lik, 
+                  interval = c(0, 10), 
+                  x        = portfolio_abs_shifts$AAPL)$minimum,
+  
+  SPY  = optimize(f        = t_dist_neg_log_lik, 
+                  interval = c(0, 10), 
+                  x        = portfolio_abs_shifts$SPY)$minimum
+)
+
+optimal_nu
+```
+
+### Simulate 10,000 random vectors
+
+```{r}
+set.seed(1235)
+
+n <- 10000
+
+# Correlation to use
+rho_abs <- with(portfolio_abs_shifts, cor(AAPL, SPY))
+rho_abs
+
+# Cholesky matrix
+corr_mat <- matrix(c(1, rho_abs, rho_abs, 1), nrow = 2)
+A <- t(chol(corr_mat))
+
+# Correlated bivariate normals
+Z_std <- matrix(rnorm(2 * n), nrow = 2)
+Z <- t(A %*% Z_std)
+
+# Get correlated uniform variables
+U <- pnorm(Z)
+
+# Use our optimal values of nu to convert to deltaX values for the t distribution
+delta_X_AAPL <- qt(U[,1], df = optimal_nu$AAPL)
+delta_X_SPY  <- qt(U[,2], df = optimal_nu$SPY)
+```
+
+### Kendall's tau and Spearman's rho
+
+Because we are using a Gaussian copula with correlation $\rho$, and because 
+the resulting rank correlations only depend on the copula, we can use:
+
+$$ \rho_{\tau} = \frac{2}{\pi} arcsin(\rho) $$
+
+$$ \rho_{s} = \frac{6}{\pi} arcsin(\frac{\rho}{2}) $$
+
+Using this, Kendall's tau should be:
+
+```{r}
+2 / pi * asin(rho_abs)
+```
+
+This can be verified from the simulated values!
+
+```{r}
+cor(delta_X_AAPL, delta_X_SPY, method = "kendall")
+```
+
+Spearman's rho should be:
+
+```{r}
+6 / pi * asin(rho_abs / 2)
+```
+
+Verified with:
+
+```{r}
+cor(delta_X_AAPL, delta_X_SPY, method = "spearman")
+```
+
+### Actual correlation - functions needed
+
+These are versions of the functions used in HW 6 question 2 to calculate the
+correlation of the distribution through finding E(XY). They are modified
+to include the fact that we have t marginals.
+
+```{r}
+# Calculate the gaussian copula but over a box, not the CDF idea
+gaussian_copula_mvtnorm_box <- function(u1, u2, l1, l2, rho) {
+
+  integrate_bivariate_normal <- function(x_upper, y_upper, x_lower, y_lower) {
+    pmvnorm(lower = c(x_lower, y_lower),
+            upper = c(x_upper, y_upper),
+            corr  = matrix(c(1, rho, rho, 1), nrow = 2))
+  }
+
+  integrate_bivariate_normal(qnorm(u1), qnorm(u2), qnorm(l1), qnorm(l2))
+}
+
+# Calculate E(XY) using the copula
+calc_E_XY <- function(x, y, rho, nu_list) {
+  
+  x_sort <- sort(x)
+  y_sort <- sort(y)
+  
+  x_nu <- nu_list[[1]]
+  y_nu <- nu_list[[2]]
+  x_mu <- mean(x)
+  y_mu <- mean(y)
+  x_sd <- sqrt(var(x) * (x_nu - 2) / x_nu)
+  y_sd <- sqrt(var(y) * (y_nu - 2) / y_nu)
+  
+  # Location scale t
+  cdf_sorted_x <- pt((x_sort - x_mu) / x_sd, df = x_nu)
+  cdf_sorted_y <- pt((y_sort - y_mu) / y_sd, df = y_nu)
+  
+  e_product <- 0
+  sum_p     <- 0
+  
+  for(i in 2:length(x)) {
+    
+    x_i   <- x_sort[i]
+    px_i  <- cdf_sorted_x[i]
+    px_i1 <- cdf_sorted_x[i-1]
+    
+    for(j in 2:length(y)) {
+  
+      y_j   <- y_sort[j]
+      py_j  <- cdf_sorted_y[j]
+      py_j1 <- cdf_sorted_y[j-1]
+      
+      p <- gaussian_copula_mvtnorm_box(px_i, py_j, px_i1, py_j1, rho = rho)
+      
+      #http://www.maths.lth.se/matstat/kurser/mas213/riemannstieltjes.pdf
+      # page 11
+      # p <- gaussian_copula_mvtnorm(px_i,  py_j,  rho) - 
+      #      gaussian_copula_mvtnorm(px_i1, py_j,  rho) - 
+      #      gaussian_copula_mvtnorm(px_i,  py_j1, rho) + 
+      #      gaussian_copula_mvtnorm(px_i1, py_j1, rho)
+      
+      e_product <- e_product + x_i * y_j * p
+      sum_p     <- sum_p + p
+      
+    }
+    #print(paste("i = ", i))
+  }
+  
+  list(e_product = e_product[1], sum_p = sum_p[1])
+}
+
+# Calculate the correlation using a copula
+calc_copula_cor <- function(x, y, rho, nu_list) {
+  e_xy_list <- calc_E_XY(x, y, rho, nu_list)
+  
+  E_XY <- e_xy_list$e_product
+  E_X  <- mean(x)
+  E_Y  <- mean(y)
+  SD_X <- sd(x)
+  SD_Y <- sd(y)
+  
+  rho_distribution <- (E_XY - E_X * E_Y) / (SD_X * SD_Y)
+  rho_distribution
+}
+```
+
+### Actual correlation of the distribution
+
+```{r}
+rho_distribution <- calc_copula_cor(portfolio_abs_shifts$AAPL, portfolio_abs_shifts$SPY, rho_abs, optimal_nu)
+rho_distribution
+```
+
+
+### $\rho$ is attainable, as we can see it lies inside the attainable correlation range.
+
+```{r}
+rho_tweaked <- rho_abs + .185
+rho_tweaked_distribution <- calc_copula_cor(portfolio_abs_shifts$AAPL, portfolio_abs_shifts$SPY, rho_tweaked, optimal_nu)
+rho_tweaked_distribution
+```
+
+### Max and min attainable correlations
+
+```{r}
+cor_max_attainable <- calc_copula_cor(portfolio_abs_shifts$AAPL, portfolio_abs_shifts$SPY, 1, optimal_nu)
+cor_max_attainable
+
+cor_min_attainable <- calc_copula_cor(portfolio_abs_shifts$AAPL, portfolio_abs_shifts$SPY, -1, optimal_nu)
+cor_min_attainable
+```
+
+# Question 2
+
+### Stock shifts
+
+```{r}
+stocks_raw <- read_rds(path = "stocks_raw.rds")
+
+stocks_prices <- stocks_raw %>%
+  select(symbol, date, close)
+
+stocks_shifts <- stocks_prices %>%
+  
+  # For each ticker
+  group_by(symbol) %>%
+  
+  # Calculate the delta_X values
+  mutate(shift = (close / lag(close) - 1) * last(close)) %>%
+  
+  select(symbol, date, shift) %>%
+  ungroup() %>%
+  na.omit()
+
+stocks_shifts
+```
+
+### Kurtosis function
+
+```{r}
+# Sample kurtosis
+kurtosis <- function(x, na.rm = FALSE) {
+  
+  if(na.rm) {
+    x <- na.omit(x)
+  }
+  
+  n <- length(x)
+  
+  numerator   <-  sum( (x - mean(x)) ^ 4 ) / n
+  denominator <- (sum( (x - mean(x)) ^ 2 ) / n) ^ 2
+  
+  numerator / denominator
+}
+```
+
+### Split up the shifts into two groups
+
+```{r}
+set.seed(12354)
+
+stocks <- unique(stocks_shifts$symbol)
+first_5 <- stocks[1:5]
+last_5  <- stocks[6:10]
+
+stocks_spread <- spread(stocks_shifts, symbol, shift)
+
+stocks_1 <- select(stocks_spread, first_5)
+stocks_2 <- select(stocks_spread, last_5)
+```
+
+### Calculate $\nu$ values.
+
+```{r}
+kur_1 <- mean(map_dbl(stocks_1, kurtosis))
+kur_1
+
+kur_2 <- mean(map_dbl(stocks_2, kurtosis))
+kur_2
+
+nu_1 <- (4 * kur_1 - 6) / (kur_1 - 3)
+nu_1
+
+nu_2 <- (4 * kur_2 - 6) / (kur_2 - 3)
+nu_2
+```
+
+### Calculate inverse gamma values
+
+```{r}
+n <- 5000
+
+U_1 <- runif(n)
+#U_2 <- runif(n)
+
+W_1 <- 1 / qgamma(U_1, shape = nu_1 / 2, rate = nu_1 / 2)
+W_2 <- 1 / qgamma(U_1, shape = nu_2 / 2, rate = nu_2 / 2)
+
+head(W_1)
+head(W_2)
+```
+
+### Calculate t-variables - unadjusted
+
+Also calculate the copula using these
+
+```{r}
+Z_std <- matrix(rnorm(n * 10), ncol = 10)
+
+cor_total <- cor(select(stocks_spread, c(first_5, last_5)))
+
+cov_1 <- cov(stocks_1)
+cov_2 <- cov(stocks_2)
+
+Z <- Z_std %*% chol(cor_total)
+
+X_1_unadjusted <- sqrt(W_1) * Z[,first_5]
+X_2_unadjusted <- sqrt(W_2) * Z[,last_5]
+
+copula <- cbind(pt(X_1_unadjusted, df = nu_1), 
+                pt(X_2_unadjusted, df = nu_2))
+
+head(copula)
+```
+
+### Make the adjustment
+
+```{r}
+X_1_adj <- X_1_unadjusted %*% diag(sqrt((nu_1 - 2) / nu_1 * diag(cov_1)))
+X_2_adj <- X_2_unadjusted %*% diag(sqrt((nu_2 - 2) / nu_2 * diag(cov_2)))
+
+colnames(X_1_adj) <- first_5
+colnames(X_2_adj) <- last_5
+```
+
+We can show that the adjustment worked because the covariance matrices are similar
+to the sample ones.
+
+```{r}
+cov(X_1_adj)
+
+cov_1
+```
+
+### MC shifts
+
+```{r}
+percentile_99 <- round(n * .01)
+
+current_prices <- stocks_prices %>%
+  group_by(symbol) %>%
+  filter(date == max(date)) %>%
+  select(-date)
+
+delta_P_sims <- cbind(X_1_adj, X_2_adj) %>%
+  as_tibble() %>%
+  gather("symbol", "delta_X") %>%
+  left_join(current_prices, "symbol") %>%
+  mutate(delta_X_shares = delta_X * 1000000 / close) %>%
+  group_by(symbol) %>%
+  mutate(sim_id = row_number()) %>%
+  group_by(sim_id) %>%
+  summarise(delta_P = sum(delta_X_shares))
+
+# Portfolio daily loss simulations
+delta_P_sims
+```
+
+### Calculate VaR
+
+```{r}
+delta_P_sims %>%
+  pull(delta_P) %>%
+  sort() %>%
+  .[percentile_99] %>%
+  set_names("VaR")
+```
+
+### Calculate historical VaR
+
+```{r}
+historical_losses <- stocks_shifts %>%
+  left_join(current_prices, "symbol") %>%
+  mutate(delta_X_shares = shift * 1000000 / close) %>%
+  group_by(date) %>%
+  summarise(delta_P = sum(delta_X_shares))
+
+historical_losses %>%
+  pull(delta_P) %>%
+  sort() %>%
+  .[2] %>%
+  set_names("Historical VaR")
+```
+

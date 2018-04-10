@@ -1,0 +1,129 @@
+---
+title: "HW 10"
+author: "Davis Vaughan"
+date: "4/9/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### Load required libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(purrr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(riingo)
+options(pillar.sigfig = 6)
+```
+
+### Load data
+
+```{r}
+end_date <- as.Date("2018-03-30")
+start_date <- end_date - years(8) + days(21) # Adjusted to be exactly 2001 points
+
+# prices_raw <- tidyquant::tq_get(c("AAPL", "SPY"), from = start_date, to = end_date)
+# prices_raw <- prices_raw %>% rename(ticker = symbol)
+# write_rds(prices_raw, "prices_raw.rds")
+prices_raw <- read_rds("prices_raw.rds")
+```
+
+### Relative shifts
+
+The close prices that we get from Yahoo are nicely already adjusted for splits,
+but not for dividends, but that is okay.
+
+```{r, fig.width=10, fig.height=6}
+prices_raw %>%
+  select(ticker, date, close) %>%
+  ggplot(aes(x = date, y = close, color = ticker)) +
+  geom_line() +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2")
+```
+
+Here we calculate relative shifts
+
+```{r}
+prices_shifts <- prices_raw %>%
+  group_by(ticker) %>%
+  mutate(losses = (close / lag(close) - 1) * last(close)) %>% 
+  select(ticker, date, losses) %>%
+  na.omit() %>%
+  spread(ticker, losses)
+
+prices_shifts
+```
+
+### VaR calculations
+
+```{r}
+shares_aapl <- 200
+shares_spy  <- 100
+
+i <- seq_len(40)
+alpha <- 0.0005 * i
+
+cutoff <- floor(2000 * alpha)
+
+calc_VaR <- function(losses, cutoff) {
+  sort(losses)[cutoff]
+}
+
+historical_VaR <- tibble(alpha, cutoff) %>%
+  mutate(
+    VaR_AAPL = calc_VaR(shares_aapl * prices_shifts$AAPL, cutoff),
+    VaR_SPY  = calc_VaR(shares_spy  * prices_shifts$SPY,  cutoff),
+    VaR_port = calc_VaR(shares_spy  * prices_shifts$SPY + shares_aapl * prices_shifts$AAPL,  cutoff)
+  )
+
+historical_VaR
+```
+
+### Check for violations of coherence
+
+I use the convention that a negative VaR is a bad thing. This is the same as 
+saying that I use "negative losses" all throughout. Because of this, we check
+the opposite condition of `VaR_port > VaR_AAPL + VaR_SPY`. If this condition
+is true, we do NOT have a violation of coherence.
+
+```{r}
+violations <- historical_VaR %>%
+  mutate(
+    violation = ! (VaR_port > VaR_AAPL + VaR_SPY)
+  )
+
+violations
+```
+
+It does not look like any alpha level results in a violation
+
+```{r}
+# Does any alpha level result in a violation?
+any(violations$violation == TRUE)
+```
+
+We can also check this with a visualization
+
+```{r, fig.width=10, fig.height=8}
+violations %>% 
+  mutate(VaR_AAPL_plus_SPY = VaR_AAPL + VaR_SPY,
+         alpha = factor(alpha)) %>%
+  select(alpha, VaR_AAPL_plus_SPY, VaR_port) %>%
+  gather("VaR_type", "VaR", contains("VaR")) %>%
+  ggplot(aes(x = alpha, y = VaR, fill = VaR_type)) +
+  geom_col(position = position_dodge(), width = .5) +
+  coord_flip() +
+  scale_y_continuous(expand = c(.01, 0)) +
+  scale_x_discrete(position = "top") +
+  scale_fill_brewer(palette = "Dark2") +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(hjust = .5), plot.subtitle = element_text(hjust = .5)) +
+  ggtitle("Visually, we see the correct relationship holds. Portfolio VaR is less negative.", 
+          subtitle = "VaR_port > VaR_AAPL + VaR_SPY")
+```
+

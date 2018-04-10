@@ -1,8 +1,0 @@
-"0","# Plot the ECDF"
-"0","ggplot(portf_abs_dg_analytical, aes(x = portf_delta_p)) +"
-"0","  stat_ecdf(geom = ""step"", size = .8) +"
-"0","  geom_hline(yintercept = 1, linetype = ""dashed"") +"
-"0","  geom_hline(yintercept = 0, linetype = ""dashed"") +"
-"0","  geom_vline(xintercept = sort(portf_abs_dg_analytical$portf_delta_p)[percentile_99], linetype = ""dashed"") + "
-"0","  theme_minimal() +"
-"0","  labs(x = ""Loss (Negative = worse)"", y = ""ECDF"", title = ""ECDF of the loss distribution. Vertical line marks VaR."")"

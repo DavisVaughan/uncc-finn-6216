@@ -1,5 +1,0 @@
-"0","spy  <- tq_get(""SPY"",  from = start_date, to = end_date, get = ""stock.prices.google"") %>% "
-"0","  select(date, close) %>%"
-"0","  rename(spy_close = close)"
-"0","aapl <- tq_get(""AAPL"", from = start_date, to = end_date, get = ""stock.prices.google"") %>%"
-"0","  select(date, close)"

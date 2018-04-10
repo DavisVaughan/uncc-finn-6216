@@ -1,2 +1,0 @@
-"0","portf_abs_full_reeval <- join_and_weight(aapl_abs_full_reeval, spy_abs, options_appl, shares_spy)"
-"0","select(portf_abs_full_reeval, date, portf_delta_p)"

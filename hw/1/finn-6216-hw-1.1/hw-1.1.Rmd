@@ -1,0 +1,550 @@
+---
+title: "HW 1.1"
+author: "Davis Vaughan"
+date: "1/12/2018"
+output:
+  html_document:
+    theme: flatly
+    highlight: kate
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## Load required packages
+
+If you want to run the code, you will need the packages below. To install 
+them you would have to do the code that is commented out. If you have any
+questions, let me know!
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(tidyquant)
+options(pillar.sigfig = 6)
+
+# To install the above packages if you don't have them:
+# install.packages("dplyr")
+# install.packages("lubridate")
+# install.packages("devtools")
+# devtools::install_github("business-science/tidyquant")
+```
+
+## Initialize variables
+
+```{r}
+# 100 shares of SPY
+shares_spy <- 100
+
+# 400 European put options on Apple
+options_appl   <- 400
+time_to_expiry <- 1
+sigma          <- .25    # volatility
+k              <- 170    # strike
+r              <- .012   # risk free int rate
+y              <- .019   # div yield
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+```
+
+## Retrieve data
+
+Based on the HW notes, "most recent AAPL price of 117.91" implies that he used
+closing prices, because that is the only one that fits.
+
+```{r}
+# google finance was deprecated
+#tq_get("SPY",  from = start_date, to = end_date, get = "stock.prices.google")
+#tq_get("AAPL", from = start_date, to = end_date, get = "stock.prices.google")
+
+spy  <- riingo::riingo_prices("SPY", start_date, end_date) %>% 
+  select(date, close) %>%
+  mutate(date = as.Date(date)) %>%
+  rename(spy_close = close)
+
+spy
+
+aapl <- riingo::riingo_prices("AAPL", start_date, end_date) %>%
+  mutate(date = as.Date(date)) %>%
+  select(date, close)
+
+aapl
+```
+
+## Black scholes pricing function
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+  
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+  
+  V
+}
+```
+
+## ECDF plotting function
+
+```{r}
+plot_ecdf <- function(x, which_approx) {
+  ggplot(x, aes(x = portf_delta_p)) +
+  stat_ecdf(geom = "step", size = .8) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_vline(xintercept = sort(x$portf_delta_p)[percentile_99], linetype = "dashed") + 
+  theme_minimal() +
+  labs(x = "Loss (Negative = worse)", y = "ECDF", 
+       title = "ECDF of the loss distribution. Vertical line marks VaR.", 
+       subtitle = which_approx)
+}
+```
+
+## VaR weighted sorter
+
+`join_and_weight()` will join the Apple and SPY delta_p's together, weighted
+appropriately.
+
+`summarise_VaR()` will calculate the VaR from the portfolio delta_p values.
+
+```{r}
+join_and_weight <- function(aapl, spy, options_aapl, shares_spy) {
+  aapl %>%
+    left_join(spy, "date") %>%
+    mutate(portf_delta_p = shares_spy * spy_delta_p + options_aapl * delta_p) %>%
+    na.omit()
+}
+
+summarise_VaR <- function(portfolio, percentile) {
+  portfolio %>%
+    summarise(VaR = sort(portf_delta_p)[percentile])
+}
+```
+
+## More setup
+
+We have to calculate the 99th percentile value for VaR. There are multiple
+ways to calculate a quantile, let's just use a simple way of taking 1% of the
+total number of differences we have (503) and rounding down. This gives us 5,
+a more conservative estimate than is required if we were allowed to interpolate.
+
+```{r}
+# 99th percentile on 503 values
+percentile_99 <- round((nrow(aapl) - 1) * 0.01)
+
+percentile_99
+```
+
+We have to calculate the 97th percentile value for ES.
+
+```{r}
+# 97th percentile on 503 values
+percentile_97 <- round((nrow(aapl) - 1) * 0.03)
+
+percentile_97
+```
+
+Also important are the current value of Apple and SPY. And the current 
+value of the put option on Apple.
+
+```{r}
+# Current value of AAPL and SPY
+current_close_aapl <- last(aapl$close)
+current_close_aapl
+
+current_close_spy  <- last(spy$spy_close)
+current_close_spy
+
+# Current put option value of AAPL
+current_option_value <- put_option_pricer(current_close_aapl, k , r, y, time_to_expiry, sigma)
+current_option_value
+```
+
+## Calculate relative and absolute differences
+
+Go ahead and calculate separate data frames for relative and absolute differences
+of Apple and SPY. These will be useful to us later.
+
+For SPY, calculating the deltaX values (relative and absolute shifts) is the
+same as calculing the deltaP values of a single share of SPY. For Apple, we
+need to also estimate the shifted option value price, which is what most 
+of this HW is about.
+
+```{r}
+# Apple relative and absolute shifts
+aapl_rel <- aapl %>%
+  mutate(daily_return = close / lag(close) - 1,
+         delta_close  = daily_return * current_close_aapl)
+
+aapl_rel
+
+aapl_abs <- aapl %>%
+  mutate(delta_close = close - lag(close))
+
+aapl_abs
+
+# Spy relative and absolute shifts
+# For SPY, the shifts (delta_x) are the delta_p values
+spy_rel <- spy %>%
+  mutate(spy_delta_p  = (spy_close / lag(spy_close) - 1) * current_close_spy)
+
+spy_rel
+
+spy_abs <- spy %>%
+  mutate(spy_delta_p = spy_close - lag(spy_close))
+
+spy_abs
+```
+
+## 1a - Delta gamma approx, Analytical, Absolute shifts
+
+Use analytical delta and gamma to calculate deltaP for Apple options.
+
+```{r}
+# Required for delta/gamma analytical
+d1 <- (log(current_close_aapl / k) + (r - y + sigma^2 / 2) * time_to_expiry) / (sigma * sqrt(time_to_expiry))
+
+# Put delta and gamma
+delta_analytical <- exp(-y * time_to_expiry) * (pnorm(d1) - 1)
+delta_analytical
+
+gamma_numerator   <- exp(-y * time_to_expiry) * exp(- (d1 ^ 2) / 2)
+gamma_denominator <- current_close_aapl * sigma * sqrt(time_to_expiry) * sqrt(2 * pi)
+
+gamma_analytical <- gamma_numerator / gamma_denominator
+gamma_analytical
+
+# Apple DG analytical approx with absolute shifts
+aapl_abs_dg_analytical <- aapl_abs %>%
+  mutate(delta_p =  delta_analytical * delta_close + 1/2 * gamma_analytical * delta_close ^ 2)
+
+aapl_abs_dg_analytical
+```
+
+Now weight and combine the Apple deltaP and SPY deltaP to get portfolio deltaP.
+
+```{r}
+portf_abs_dg_analytical <- join_and_weight(aapl_abs_dg_analytical, spy_abs, options_appl, shares_spy)
+select(portf_abs_dg_analytical, date, portf_delta_p)
+```
+
+Sort and take the 5th worst value (corresponds to 99% percentile) to get VaR.
+
+```{r}
+# Portfolio VaR
+summarise_VaR(portf_abs_dg_analytical, percentile_99)
+```
+
+Also add a plot of the ECDF
+
+Every plot of the ECDF looks like this one, so I will only show just this one.
+
+```{r}
+plot_ecdf(portf_abs_dg_analytical, "Delta gamma approx, Analytical, Absolute shifts")
+```
+
+## 1b - Delta gamma approx, Numerical, Absolute shifts
+
+For Apple options, rather than using Black scholes delta/gamma, let's approximate
+them using the central difference estimators we talked about in class.
+
+```{r}
+aapl_abs_dg_numerical <- aapl_abs %>%
+  na.omit() %>%
+  mutate(
+
+    # Calculate h for absolute
+    h                = sqrt(var(delta_close) + mean(delta_close) ^ 2),
+
+    # Recalculate the put options with a shock upward
+    shift_up_close   = put_option_pricer(current_close_aapl + h, k, r, y, time_to_expiry, sigma),
+
+    # Recalculate the put options with a shock downward
+    shift_down_close = put_option_pricer(current_close_aapl - h, k, r, y, time_to_expiry, sigma),
+
+    # This is P in the formula, used by gamma
+    no_shift_close   = put_option_pricer(current_close_aapl, k, r, y, time_to_expiry, sigma),
+
+    # Approximate delta
+    delta_numerical  = (shift_up_close - shift_down_close) / (2 * h),
+
+    # Approximate gamma
+    gamma_numerical  = (shift_up_close - 2 * no_shift_close + shift_down_close) / (h^2),
+
+    # Calculate delta_p from numerical delta/gamma
+    delta_p          = delta_numerical * delta_close + 1/2 * gamma_numerical * delta_close ^ 2
+  )
+
+# This is h
+aapl_abs_dg_numerical$h[1]
+
+# Here are the shifts
+select(aapl_abs_dg_numerical, date, contains("shift"))
+
+# Here is delta / gamma  / delta_p
+select(aapl_abs_dg_numerical, date, delta_numerical, gamma_numerical, delta_p)
+```
+
+Now weight and combine the Apple deltaP and SPY deltaP to get portfolio deltaP.
+
+```{r}
+portf_abs_dg_numerical <- join_and_weight(aapl_abs_dg_numerical, spy_abs, options_appl, shares_spy)
+select(portf_abs_dg_numerical, date, portf_delta_p)
+```
+
+Portfolio VaR
+
+```{r}
+summarise_VaR(portf_abs_dg_numerical, percentile_99)
+```
+
+## 1c - Grid approx, Absolute
+
+The `approx()` function below uses linear interpolation by default.
+
+There is no need to do a grid for SPY. For Apple, we needed to approximate
+the relationship between a shift in the underlying and a shift in the value
+of the option. We don't have to do that with SPY since we are directly holding
+shares of it.
+
+The approximation done below is done with `x = Apple prices` and `y = Apple option values`
+so that we can pass in shifted Apple prices, with the shifts being either absolute
+or relative.
+
+```{r}
+grid_multipliers <- c(.6, .7, .8, .9, .95, .99, 1, 1.01, 1.05, 1.1, 1.2, 1.3, 1.4)
+grid_prices      <- grid_multipliers * current_close_aapl
+grid_options     <- put_option_pricer(grid_prices, k, r, y, time_to_expiry, sigma)
+
+aapl_abs_grid <- aapl_abs %>%
+  na.omit() %>%
+  mutate(
+    shifted_current_close       = delta_close + current_close_aapl,
+    approx_shifted_option_value = approx(x = grid_prices, y = grid_options, xout = shifted_current_close)$y,
+    delta_p                     = approx_shifted_option_value - current_option_value
+  )
+
+select(aapl_abs_grid, -close, -delta_close)
+```
+
+```{r}
+portf_abs_grid <- join_and_weight(aapl_abs_grid, spy_abs, options_appl, shares_spy)
+select(portf_abs_grid, date, portf_delta_p)
+```
+
+```{r}
+summarise_VaR(portf_abs_grid, percentile_99)
+```
+
+
+## 1d - Full reeval, Absolute
+
+This time we do a full reevaluation. Shift the current close price of Apple
+forward 1 day by using the historical absolute shifts, and then revalue the 
+option. The difference between the current option price and the shifted option
+prices is your column of delta_p's.
+
+```{r}
+aapl_abs_full_reeval <- aapl_abs %>%
+  mutate(shifted_current_close = current_close_aapl + delta_close,
+         shifted_option_value  = put_option_pricer(shifted_current_close, k, r, y, time_to_expiry, sigma),
+         delta_p               = shifted_option_value - current_option_value)
+
+select(aapl_abs_full_reeval, -close, -delta_close)
+```
+
+```{r}
+portf_abs_full_reeval <- join_and_weight(aapl_abs_full_reeval, spy_abs, options_appl, shares_spy)
+select(portf_abs_full_reeval, date, portf_delta_p)
+```
+
+```{r}
+summarise_VaR(portf_abs_full_reeval, percentile_99)
+```
+
+## 1e - Delta gamma approx, Analytical, Relative shifts
+
+```{r}
+# Apple DG approx of delta_p
+aapl_rel_dg_analytical <- aapl_rel %>%
+  mutate(delta_p =  delta_analytical * delta_close + 1/2 * gamma_analytical * delta_close ^ 2)
+```
+
+Now weight and combine the Apple deltaP and SPY deltaP to get portfolio deltaP.
+
+```{r}
+portf_rel_dg_analytical <- join_and_weight(aapl_rel_dg_analytical, spy_rel, options_appl, shares_spy)
+select(portf_rel_dg_analytical, date, portf_delta_p)
+```
+
+```{r}
+# Portfolio VaR
+summarise_VaR(portf_rel_dg_analytical, percentile_99)
+```
+
+## 1f - Delta gamma approx, Numerical, Relative shifts
+
+```{r}
+aapl_rel_dg_numerical <- aapl_rel %>%
+  na.omit() %>%
+  mutate(
+
+    # Calculate h for absolute
+    h                = sqrt(var(delta_close / close) + mean(delta_close / close) ^ 2),
+
+    # Recalculate the put options with a shock upward
+    shift_up_close   = put_option_pricer(current_close_aapl + h * current_close_aapl, k, r, y, time_to_expiry, sigma),
+
+    # Recalculate the put options with a shock downward
+    shift_down_close = put_option_pricer(current_close_aapl - h * current_close_aapl, k, r, y, time_to_expiry, sigma),
+
+    # This is P in the formula, used by gamma
+    no_shift_close   = put_option_pricer(current_close_aapl, k, r, y, time_to_expiry, sigma),
+
+    # Approximate delta
+    delta_numerical  = (shift_up_close - shift_down_close) / (2 * h * current_close_aapl),
+
+    # Approximate gamma
+    gamma_numerical  = (shift_up_close - 2 * no_shift_close + shift_down_close) / ((h * current_close_aapl)^2),
+
+    # Calculate delta_p from numerical delta/gamma
+    delta_p          = delta_numerical * delta_close + 1/2 * gamma_numerical * delta_close ^ 2
+  )
+
+# This is h
+aapl_rel_dg_numerical$h[1]
+
+# Here are the shifts
+select(aapl_rel_dg_numerical, date, contains("shift"))
+
+# Here is delta / gamma  / delta_p
+select(aapl_rel_dg_numerical, date, delta_numerical, gamma_numerical, delta_p)
+```
+
+```{r}
+portf_rel_dg_numerical <- join_and_weight(aapl_rel_dg_numerical, spy_rel, options_appl, shares_spy)
+select(portf_rel_dg_numerical, date, portf_delta_p)
+```
+
+Portfolio VaR
+
+```{r}
+summarise_VaR(portf_rel_dg_numerical, percentile_99)
+```
+
+## 1g - Grid approx, Relative
+
+```{r}
+grid_multipliers <- c(.6, .7, .8, .9, .95, 1, 1.01, 1.05, 1.1, 1.2, 1.3, 1.4)
+grid_prices      <- grid_multipliers * current_close_aapl
+grid_options     <- put_option_pricer(grid_prices, k, r, y, time_to_expiry, sigma)
+
+aapl_rel_grid <- aapl_rel %>%
+  na.omit() %>%
+  mutate(
+    shifted_current_close       = delta_close + current_close_aapl,
+    approx_shifted_option_value = approx(x = grid_prices, y = grid_options, xout = shifted_current_close)$y,
+    delta_p                     = approx_shifted_option_value - current_option_value
+  )
+
+select(aapl_rel_grid, -close, -daily_return, -delta_close)
+```
+
+```{r}
+portf_rel_grid <- join_and_weight(aapl_rel_grid, spy_abs, options_appl, shares_spy)
+select(portf_rel_grid, date, portf_delta_p)
+```
+
+```{r}
+summarise_VaR(portf_rel_grid, percentile_99)
+```
+
+## 1h - Full reeval, Relative shifts
+
+```{r}
+aapl_rel_full_reeval <- aapl_rel %>%
+  mutate(shifted_current_close = current_close_aapl + delta_close,
+         shifted_option_value  = put_option_pricer(shifted_current_close, k, r, y, time_to_expiry, sigma),
+         delta_p               = shifted_option_value - current_option_value)
+```
+
+```{r}
+portf_rel_full_reeval <- join_and_weight(aapl_rel_full_reeval, spy_rel, options_appl, shares_spy)
+select(portf_rel_full_reeval, date, portf_delta_p)
+```
+
+```{r}
+summarise_VaR(portf_rel_full_reeval, percentile_99)
+```
+
+## 2a - ES, DG approx, Analytical, Absolute
+
+For the expected shortfall ones, we just recalculate the 97% VaR, then filter
+our portfolio deltaP values for only those worse than the 97% VaR, then take
+an average of those values.
+
+This is a function for easily calculating ES each time.
+
+```{r}
+summarise_ES <- function(portfolio, percentile) {
+  portf_VaR <- sort(portfolio$portf_delta_p)[percentile]
+  
+  portfolio %>%
+    filter(portf_delta_p <= portf_VaR) %>%
+    summarise(
+      VaR = portf_VaR,
+      ES  = mean(portf_delta_p))
+}
+```
+
+```{r}
+summarise_ES(portf_abs_dg_analytical, percentile_97)
+```
+
+## 2b - ES, DG approx, Numerical, Absolute
+
+```{r}
+summarise_ES(portf_abs_dg_numerical, percentile_97)
+```
+
+## 2c - ES, Grid, Absolute
+
+```{r}
+summarise_ES(portf_abs_grid, percentile_97)
+```
+
+## 2d - ES, Full reeval, Absolute
+
+```{r}
+summarise_ES(portf_abs_full_reeval, percentile_97)
+```
+
+## 2e - ES, DG approx, Analytical, Relative
+
+```{r}
+summarise_ES(portf_rel_dg_analytical, percentile_97)
+```
+
+## 2f - ES, DG approx, Numerical, Relative
+
+```{r}
+summarise_ES(portf_rel_dg_numerical, percentile_97)
+```
+
+## 2g - ES, Grid, Relative
+
+```{r}
+summarise_ES(portf_rel_grid, percentile_97)
+```
+
+## 2h - ES, Full reeval, Relative
+
+```{r}
+summarise_ES(portf_rel_full_reeval, percentile_97)
+```
+
+

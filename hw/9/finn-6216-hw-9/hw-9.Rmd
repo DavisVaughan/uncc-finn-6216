@@ -1,0 +1,358 @@
+---
+title: "HW 9"
+author: "Davis Vaughan"
+date: "4/3/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+### Load required libraries
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(purrr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+options(pillar.sigfig = 6)
+
+# Used for Differential Evolution optimization testing
+library(DEoptim)
+library(parallel)
+```
+
+### Load data
+
+```{r}
+portfolio <- c("AAPL", "SPY")
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+# library(tidyquant)
+# portfolio_raw  <- tq_get(portfolio,  from = start_date, to = end_date, get = "stock.prices.google")
+# write_rds(portfolio_raw, "portfolio_raw.rds")
+portfolio_raw <- read_rds("portfolio_raw.rds")
+```
+
+### Relative shifts
+
+```{r}
+portfolio_shifts <- portfolio_raw %>%
+  # Force symbol as factor so spread() doesn't reorder
+  mutate(symbol = as_factor(symbol)) %>% 
+  group_by(symbol) %>%
+  mutate(delta_X = (close / lag(close) - 1L) * last(close)) %>%
+  select(symbol, date, delta_X) %>%
+  na.omit()
+
+portfolio_shifts
+```
+
+### Sample mean and covariance
+
+We recalculate them later, but this is just showing them now.
+
+```{r}
+portfolio_wide <- portfolio_shifts %>%
+  spread(symbol, delta_X) %>%
+  select(-date)
+
+means <- colMeans(portfolio_wide)
+cov_mat <- cov(portfolio_wide)
+
+means
+cov_mat
+```
+
+### Demean the shifts
+
+```{r}
+portfolio_shifts_demeaned <- portfolio_shifts %>%
+  mutate(delta_X = delta_X - mean(delta_X))
+
+portfolio_shifts_demeaned
+
+portfolio_wide_demeaned <- portfolio_shifts_demeaned %>%
+  spread(symbol, delta_X) %>%
+  select(-date)
+```
+
+### Log likelihood function
+
+```{r}
+ccc_garch_llh <- function(
+  params = c(alpha1_0 = .1, alpha1_1 = .1, beta1_1 = .1,
+             alpha2_0 = .1, alpha2_1 = .1, beta2_1 = .1), .x) {
+  
+  a1_0 <- params[1]
+  a1_1 <- params[2]
+  b1_1 <- params[3]
+  a2_0 <- params[4]
+  a2_1 <- params[5]
+  b2_1 <- params[6]
+  
+  cov_mat   <- cov(.x)
+  x_sd_init <- sqrt(c(cov_mat[1, 1], cov_mat[2, 2])) # Initial value for conditional sd
+  rho       <- cor(.x)[1,2] # correlation is constant
+  
+  # Setup empty conditional sd matrix
+  x_cond_sd <- matrix(NA_real_, nrow = nrow(.x), ncol = ncol(.x))
+  x_cond_sd[1,] <- x_sd_init
+  
+  # Calc the recursive matrix of GARCH(1,1) sd values
+  for(i in 2:nrow(.x)) {
+    x_cond_sd[i, 1] <- sqrt(a1_0 + a1_1 * .x[i-1, 1] ^ 2 + b1_1 * x_cond_sd[i-1, 1] ^ 2)
+    x_cond_sd[i, 2] <- sqrt(a2_0 + a2_1 * .x[i-1, 2] ^ 2 + b2_1 * x_cond_sd[i-1, 2] ^ 2)
+  }
+
+  # Calculate the LLH values
+  n <- nrow(.x)
+
+  # The LLH is composed of two parts. The first is a constant...
+  llh_const <- - n * log(2 * pi) - n / 2 * log(1 - rho^2)
+
+  # ...the second is the sum of this vector
+  llh_vec <- log(x_cond_sd[,1]) +
+             log(x_cond_sd[,2]) +
+             .5 * ((.x[,1] ^ 2 * x_cond_sd[,1] ^ 2 - 2 * rho * .x[,1] * .x[,2] * x_cond_sd[,1] * x_cond_sd[,2] + .x[,2] ^ 2 * x_cond_sd[,2] ^ 2) /
+                  (x_cond_sd[,1] ^ 2 * x_cond_sd[,2] ^ 2 * (1 - rho ^ 2)))
+  
+  # Remove the first one, this corresponds to the initialized values, and they are junk
+  llh_vec <- llh_vec[-1]
+
+  # Add the parts together. The result is the log(LLH)
+  # We want to minimize neg_log(LLH) so add a - out front
+  neg_llh <- - (llh_const - sum(llh_vec))
+  
+  # Penalization terms if alpha1_1 + beta1_1 < 1 not satisfied
+  # This is a clever way to enforce constraints. It makes the LLH enormous
+  # if not satisfied
+  penalize_1 <- 1e15 * max(sum(c(a1_1, b1_1)) - .9999999, 0)
+  penalize_2 <- 1e15 * max(sum(c(a2_1, b2_1)) - .9999999, 0)
+  
+  neg_llh_penalized <- neg_llh + penalize_1 + penalize_2
+  
+  neg_llh_penalized
+}
+```
+
+### Calculate the optimal parameters
+
+This uses Differential Evolution. That is a global optimizer that often
+performs better on these tough problems, and does not fall into a local optimum.
+
+```{r}
+ctrl <- DEoptim.control(parallelType = 1, 
+                        itermax = 10000, 
+                        reltol = .0000001, 
+                        steptol = 200, 
+                        trace = 100)
+
+opt <- DEoptim(ccc_garch_llh, 
+        lower = c(0.00000001, 0, 0, 0.00000001, 0, 0), 
+        upper = c(5, 1, 1, 5, 1, 1),
+        .x = as.matrix(portfolio_wide_demeaned),
+        control = ctrl)
+```
+
+```{r}
+tibble(
+  Parameter = c("alpha1_0", "alpha1_1", "beta1_1", "alpha2_0", "alpha2_1", "beta2_1"),
+  Value     = opt$optim$bestmem
+)
+```
+
+```{r}
+tibble(Min_Neg_LLH = opt$optim$bestval)
+```
+
+
+### Supplemental optimization
+
+I often like to run the solution of differential evolution through a more 
+standard solver to see if we can get any better quickly. In this case, it does
+not do much, which is good. It means differential evolution worked well for us.
+
+`nmkb()` is "an implementation of the Nelder-Mead algorithm for derivative-free optimization".
+It is useful because the derivative free part means we can place box constraints
+on our parameters.
+
+```{r}
+optimal_soln <- dfoptim::nmkb(
+  par     = opt$optim$bestmem, 
+  fn      = ccc_garch_llh, 
+  
+  # The constants technically have to be larger than 0
+  lower   = c(0.00000001, 0, 0, 0.00000001, 0, 0),
+  
+  # Upper bound of 2. The constraint in the objective function takes care of the alpha+beta<1 problem
+  upper   = c(5, 1, 1, 5, 1, 1),
+  
+  .x      = as.matrix(portfolio_wide_demeaned),
+  control = list(tol = 1e-15, maxfeval = 10000, restarts.max = 50)
+)
+
+optimal_soln
+```
+
+### Question 2
+
+Simulate using:
+
+$$
+X_t =  \left[ {\begin{array}{cc}
+        \sigma_{t,1} & 0            \\
+        0            & \sigma_{t,2} \\
+     \end{array} } \right] 
+     \left[ {\begin{array}{cc}
+        1 & 0            \\
+        \rho            & \sqrt{1 - \rho^2} \\
+     \end{array} } \right] 
+     \left[ {\begin{array}{c}
+        Z_{t,1} \\
+        Z_{t,2} \\
+     \end{array} } \right] 
+$$
+
+1) Simulate 5000 random normal pairs
+2) Add correlation using 
+
+$$
+Zcor_{t,1} = Z_{t,1} \\
+Zcor_{t,2} = Z_{t,1} * \rho + Z_{t,2} * \sqrt{1 - \rho^2}
+$$
+
+3) Then simulate the X values with
+
+$$
+X_{t,1} = Zcor_{t,1} * \sigma_{t,1} \\
+X_{t,2} = Zcor_{t,2} * \sigma_{t,2}
+$$
+
+4) In order to simulate the X values above, you need to be filling in the conditional sd
+along the way with
+
+$$
+\sigma_{t,1} = \sqrt{\alpha_{1_{0}} + \alpha_{1_{1}} * X_{t-1,1} ^ 2 + \beta_{1_{1}} * \sigma_{t-1,1} ^ 2} \\
+\sigma_{t,2} = \sqrt{\alpha_{2_{0}} + \alpha_{2_{1}} * X_{t-1,2} ^ 2 + \beta_{2_{1}} * \sigma_{t-1,2} ^ 2}
+$$
+
+### Perform the simulation of the shifts
+
+```{r}
+n <- 5000
+set.seed(12345)
+
+rho <- cor(portfolio_wide_demeaned)[1,2]
+rho
+
+# Random normals
+Z_1 <- rnorm(n)
+Z_2 <- rnorm(n)
+
+# Add correlation
+Z_1_cor <- Z_1
+Z_2_cor <- Z_1 * rho + Z_2 * sqrt(1 - rho ^ 2)
+
+# Optimal parameters
+params <- optimal_soln$par
+
+# Setup empty X and X_sd vectors
+X_1 <- vector("numeric", n)
+X_2 <- vector("numeric", n)
+
+X_1_sd <- vector("numeric", n+1)
+X_2_sd <- vector("numeric", n+1)
+
+# Initialize with the sd of each stock 
+X_1_sd[1] <- sqrt(cov(portfolio_wide_demeaned)[1,1])
+X_2_sd[1] <- sqrt(cov(portfolio_wide_demeaned)[2,2])
+
+# Perform the recursive simulation
+for(i in 1:n) {
+  # Update today's X values
+  X_1[i] <- Z_1_cor[i] * X_1_sd[i]
+  X_2[i] <- Z_2_cor[i] * X_2_sd[i]
+
+  # Update tomorrow's conditional sd
+  X_1_sd[i+1] <- sqrt(params[1] + params[2] * X_1[i] ^ 2 + params[3] * X_1_sd[i] ^ 2)
+  X_2_sd[i+1] <- sqrt(params[4] + params[5] * X_2[i] ^ 2 + params[6] * X_2_sd[i] ^ 2)
+}
+
+# Add back means
+X_1 <- X_1 + means[["AAPL"]]
+X_2 <- X_2 + means[["SPY"]]
+
+head(X_1)
+```
+
+### Information from HW 1
+
+```{r}
+# 100 shares of SPY
+shares_spy <- 100
+
+# 400 European put options on Apple
+options_appl   <- 400
+time_to_expiry <- 1
+sigma          <- .25    # volatility
+k              <- 170    # strike
+r              <- .012   # risk free int rate
+y              <- .019   # div yield
+```
+
+### Put option pricing function
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+  
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+  
+  V
+}
+```
+
+### Calculate portfolio loss simulations
+
+```{r}
+percentile_99 <- round(n * .01)
+percentile_99
+
+current_prices <- portfolio_raw %>%
+  group_by(symbol) %>%
+  filter(date == max(date)) %>%
+  select(symbol, close) %>%
+  spread("symbol", "close")
+
+current_option_value <- put_option_pricer(current_prices$AAPL, k, r, y, time_to_expiry, sigma)
+
+delta_P_sims <- cbind(AAPL = X_1, SPY = X_2) %>%
+  as_tibble() %>%
+  mutate(AAPL_shifted_close  = AAPL + current_prices$AAPL,
+         AAPL_shifted_option = put_option_pricer(AAPL_shifted_close, k, r, y, time_to_expiry, sigma),
+         delta_X_SPY         = SPY,
+         delta_X_AAPL        = AAPL_shifted_option - current_option_value,
+         delta_P             = delta_X_SPY * shares_spy + delta_X_AAPL * options_appl)
+
+# Portfolio daily loss simulations
+select(delta_P_sims, delta_X_SPY, delta_X_AAPL, delta_P)
+```
+
+### Calculate VaR
+
+```{r}
+delta_P_sims %>%
+  pull(delta_P) %>%
+  sort() %>%
+  .[percentile_99] %>%
+  set_names("VaR")
+```
+

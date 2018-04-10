@@ -1,4 +1,0 @@
-"0","# Portfolio VaR"
-"0","portf_abs_dg_analytical %>%"
-"0","  na.omit() %>%"
-"0","  summarise(VaR_abs_dg_analytical = sort(portf_delta_p)[percentile_99])"

@@ -1,0 +1,236 @@
+---
+title: "HW 8"
+author: "Davis Vaughan"
+date: "3/28/2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load data and libraries needed
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(purrr)
+library(readr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+options(pillar.sigfig = 6)
+
+portfolio <- c("AAPL", "SPY")
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+# library(tidyquant)
+# portfolio_raw  <- tq_get(portfolio,  from = start_date, to = end_date, get = "stock.prices.google")
+# write_rds(portfolio_raw, "portfolio_raw.rds")
+portfolio_raw <- read_rds("portfolio_raw.rds")
+```
+
+# Question 2
+
+### Absolute shifts
+
+```{r}
+portfolio_abs_shifts <- portfolio_raw %>%
+  group_by(symbol) %>%
+  mutate(delta_X = close - lag(close)) %>%
+  select(symbol, date, delta_X) %>%
+  na.omit()
+
+portfolio_abs_shifts
+```
+
+### Custom multi lag function
+
+You can really just ignore this.
+
+Helpers
+
+```{r}
+# For each n, create a named list element holding the call
+map_quos <- function(var, indices, default, lag_lead) {
+
+  # For each index to lag/lead, create a quo call
+  if(lag_lead == "lag") {
+    lag <- dplyr::lag
+    quo_list <- purrr::map(indices, ~rlang::quo(lag(!!var, !!.x, !!default)))
+  } else if(lag_lead == "lead") {
+    lead <- dplyr::lead
+    quo_list <- purrr::map(indices, ~rlang::quo(lead(!!var, !!.x, !!default)))
+  }
+
+  # Create and set names
+  fmt <- paste0("%s_", lag_lead, "_%02d")
+  nms <- sprintf(fmt, as.character(var), indices)
+
+  rlang::set_names(quo_list, nms)
+}
+
+extract_vars <- function(x, ...) {
+  vars_char <- tidyselect::vars_select(colnames(x), !!! rlang::enquos(...))
+  vars_syms <- rlang::syms(unname(vars_char))
+  vars_syms
+}
+
+# A glue version of stop()
+glue_stop <- function(..., .sep = "") {
+  stop(glue::glue(..., .sep, .envir = parent.frame()), call. = FALSE)
+}
+```
+
+Multi lag. This function lets you calculate multiple lags all at once.
+
+```{r}
+lags <- function(x, n = 1, ..., default = NA) {
+  UseMethod("lags")
+}
+
+lags.default <- function(x, n = 1, ..., default = NA) {
+  classes <- paste(class(x), collapse = ", ")
+  glue_stop("No supported method of lags() for class: ", classes)
+}
+
+lags.data.frame <- function(x, n = 1, ..., default = NA){
+  vars <- extract_vars(x, ...)
+
+  # For each var to lag, create the list of calls
+  calls_list <- purrr::map(vars, ~map_quos(.x, n, default, "lag"))
+
+  # The above results in a list of lists. Flatten to get 1 list of calls
+  calls <- rlang::flatten(calls_list)
+
+  dplyr::mutate(x, !!! calls)
+}
+
+lags.tbl <- lags.data.frame
+```
+
+Example:
+
+```{r}
+lags(portfolio_abs_shifts, 1:2, delta_X)
+```
+
+
+### Correlogram setup
+
+```{r}
+correlate_lagged <- function(x, n = 1L) {
+  x %>%
+    lags(n, delta_X) %>%
+    select(symbol, contains("delta_X")) %>%
+    nest() %>%
+    mutate(cor = map(data, ~corrr::correlate(.x, use = "complete.obs") %>% corrr::focus(delta_X))) %>%
+    unnest(cor) %>%
+    separate(rowname, c("name", "lag"), sep = -2, convert = TRUE) %>%
+    mutate(lag = as.factor(lag))
+}
+```
+
+```{r}
+all_lags <- correlate_lagged(portfolio_abs_shifts, 1:10)
+
+all_lags %>%
+  select(-name) %>%
+  rename(correlation_to_lag_0 = delta_X) %>%
+  kable()
+```
+
+### Absolute shifts
+
+There does not look to be any autocorrelation here.
+
+```{r, fig.height=10, fig.width=10}
+n <- filter(portfolio_abs_shifts, symbol == "AAPL") %>% nrow()
+ci <- qnorm( (1 + .95) / 2 ) / sqrt(n)
+
+all_lags %>%
+  ggplot(aes(x = lag, y = delta_X)) +
+  geom_col(width = .3) +
+  geom_hline(yintercept = ci, linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -ci, linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = 0, size = .2) +
+  facet_wrap(~symbol, nrow = 2) +
+  coord_cartesian(ylim = c(-.2, 1)) +
+  ggtitle("Correlogram - Absolute shifts")
+```
+
+### Absolute value of absolute shifts
+
+It looks like there is autocorrelation in the absolute value of the shifts.
+
+```{r, fig.height=10, fig.width=10}
+portfolio_abs_shifts %>%
+  mutate(delta_X = abs(delta_X)) %>%
+  correlate_lagged(1:10) %>%
+  ggplot(aes(x = lag, y = delta_X)) +
+  geom_col(width = .3) +
+  geom_hline(yintercept = ci, linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = -ci, linetype = "dashed", color = "blue") +
+  geom_hline(yintercept = 0, size = .2) +
+  facet_wrap(~symbol, nrow = 2) +
+  coord_cartesian(ylim = c(-.2, 1)) +
+  ggtitle("Correlogram - Absolute value of absolute shifts")
+```
+
+### Ljung-Box test
+
+We need a function to calculate the statistic and p-value.
+
+```{r}
+ljung_box <- function(x, h = 1) {
+  
+  stopifnot(h > 0)
+  
+  # Calculate the k-th box element
+  box_k <- function(x, k, n) {
+    autocor <- cor(x, lag(x, k), use = "pairwise.complete.obs")
+    (autocor ^ 2) / (n - k)
+  }
+  
+  n <- length(x)
+  k_vals <- seq_len(h)
+  Q_unadjusted <- sum(purrr::map_dbl(k_vals, ~box_k(x, .x, n)))
+  Q <- n * (n + 2) * Q_unadjusted
+  
+  p_val <- 1 - pchisq(Q, df = h)
+  
+  tibble(Q = Q, p_val = p_val)
+}
+```
+
+Fail to reject that the data are iid.
+
+```{r}
+portfolio_abs_shifts %>% 
+  nest() %>%
+  mutate(ljung = map(data, ~ljung_box(.$delta_X, 10))) %>%
+  unnest(ljung) %>%
+  select(symbol, Q, p_val) %>%
+  kable()
+```
+
+Definitely reject that the absolute value of the shifts are iid.
+
+```{r}
+portfolio_abs_shifts %>% 
+  mutate(delta_X_abs = abs(delta_X)) %>%
+  nest() %>%
+  mutate(ljung = map(data, ~ljung_box(.$delta_X_abs, 10))) %>%
+  unnest(ljung) %>%
+  select(symbol, Q, p_val) %>%
+  kable()
+```
+
+### Summary
+
+The shifts themselves don't seem to exhibit serial correlation, but the variance
+of the shifts does. This is shown through the absolute value of the shifts showing
+large amounts of serial correlation. Banks should likely be using _conditional
+variance_ VaR models rather than purely unconditional models.
+

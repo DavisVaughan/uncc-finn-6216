@@ -1,0 +1,624 @@
+---
+title: "HW2"
+author: "Davis Vaughan"
+date: "1/26/2018"
+output:
+  html_document:
+    theme: flatly
+    highlight: kate
+---
+
+## Load required packages
+
+If you want to run the code, you will need the packages below. To install 
+them you would have to do the code that is commented out. If you have any
+questions, let me know!
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(lubridate)
+library(tidyquant)
+options(pillar.sigfig = 6)
+
+# To install the above packages if you don't have them:
+# install.packages("dplyr")
+# install.packages("lubridate")
+# install.packages("devtools")
+# devtools::install_github("business-science/tidyquant")
+```
+
+## Initialize variables
+
+```{r}
+# 100 shares of SPY
+shares_spy <- 100
+
+# 400 European put options on Apple
+options_appl   <- 400
+time_to_expiry <- 1
+sigma          <- .25    # volatility
+k              <- 170    # strike
+r              <- .012   # risk free int rate
+y              <- .019   # div yield
+
+# Dates
+end_date   <- as.Date("2018-01-05")
+start_date <- end_date - years(2) + days(2) # Add two days to get the correct 504 prices
+
+```
+
+## Retrieve data
+
+Based on the HW notes, "most recent AAPL price of 175" implies that he used
+closing prices, because that is the only one that fits.
+
+```{r}
+spy  <- tq_get("SPY",  from = start_date, to = end_date, get = "stock.prices.google") %>% 
+  select(date, close) %>%
+  rename(spy_close = close)
+
+spy
+
+aapl <- tq_get("AAPL", from = start_date, to = end_date, get = "stock.prices.google") %>%
+  select(date, close)
+
+aapl
+```
+
+## Black scholes pricing function
+
+```{r}
+put_option_pricer <- function(s, k, r, y, t, sigma) {
+  
+  d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+  d2 <- d1 - sigma * sqrt(t)
+  
+  V <- pnorm(-d2) * k * exp(-r * t) - s * exp(-y * t) * pnorm(-d1)
+  
+  V
+}
+```
+
+## More setup
+
+```{r}
+# 99th percentile on 503 values
+percentile_99 <- round((nrow(aapl) - 1) * 0.01)
+
+percentile_99
+```
+
+Also important are the current value of Apple and SPY. And the current 
+value of the put option on Apple.
+
+```{r}
+# Current value of AAPL and SPY
+current_close_aapl <- last(aapl$close)
+current_close_aapl
+
+current_close_spy  <- last(spy$spy_close)
+current_close_spy
+
+# Current put option value of AAPL
+current_option_value <- put_option_pricer(current_close_aapl, k , r, y, time_to_expiry, sigma)
+current_option_value
+```
+
+```{r}
+plot_ecdf <- function(full_reeval, dg_numerical, grid) {
+  full_reeval  <- rename(full_reeval, full_reeval = delta_p) %>% select(date, full_reeval)
+  dg_numerical <- rename(dg_numerical, dg_numerical = delta_p) %>% select(date, dg_numerical)
+  grid         <- rename(grid, grid = delta_p) %>% select(date, grid)
+  
+  left_join(left_join(full_reeval, dg_numerical, by = "date"), grid, "date") %>%
+    gather(EvaluationType, delta_p, -date) %>%
+    ggplot(aes(x = delta_p, color = EvaluationType)) +
+    stat_ecdf(geom = "step", size = .8, alpha = .7) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_minimal() 
+}
+```
+
+
+## Calculate relative and absolute differences
+
+Go ahead and calculate separate data frames for absolute differences
+of Apple and SPY. These will be useful to us later.
+
+For SPY, calculating the deltaX values (absolute shifts) is the
+same as calculing the deltaP values of a single share of SPY. For Apple, we
+need to also estimate the shifted option value price.
+
+```{r}
+# Apple absolute shifts
+aapl_abs <- aapl %>%
+  mutate(delta_close = close - lag(close))
+
+aapl_abs
+
+# Spy absolute shifts
+# For SPY, the shifts (delta_x) are the delta_p values
+spy_abs <- spy %>%
+  mutate(spy_delta_p = spy_close - lag(spy_close))
+
+spy_abs
+```
+
+## 1 - Jarque Bera
+
+```{r}
+# Sample skewness
+skewness <- function(x, na.rm = FALSE) {
+  
+  if(na.rm) {
+    x <- na.omit(x)
+  }
+
+  n <- length(x)
+  
+  numerator   <-  sum( (x - mean(x)) ^ 3 ) / n
+  denominator <- (sum( (x - mean(x)) ^ 2 ) / n) ^ (3 / 2)
+  
+  numerator / denominator
+}
+
+# Sample kurtosis
+kurtosis <- function(x, na.rm = FALSE) {
+  
+  if(na.rm) {
+    x <- na.omit(x)
+  }
+  
+  n <- length(x)
+  
+  numerator   <-  sum( (x - mean(x)) ^ 4 ) / n
+  denominator <- (sum( (x - mean(x)) ^ 2 ) / n) ^ 2
+  
+  numerator / denominator
+}
+
+# Statistic
+jarque_bera_stat <- function(x) {
+  
+  if(any(is.na(x))) {
+    stop("NA values in x")
+  }  
+  
+  1/6 * length(x) * (skewness(x) ^ 2 + 1/4 * (kurtosis(x) - 3) ^ 2)
+}
+
+# P-value
+jarque_bera_pval <- function(x) {
+  stat <- jarque_bera_stat(x)
+  pval <- 1 - pchisq(stat, df = 2)
+  pval
+}
+```
+
+Calculate the daily price changes and the log returns and apply our jarque bera
+stats.
+
+You said "price change," but I included the arithmetic return as well in case
+that is what you meant.
+
+Definitely NOT normal! p-values are all 0
+
+```{r}
+spy %>%
+  # Rename so you can combine them easier
+  rename(close = spy_close) %>%
+  bind_rows(spy = ., aapl = aapl, .id = "asset") %>%
+  group_by(asset) %>%
+  
+  # For SPY and AAPL, calculate price changes and log returns
+  mutate(price_change      = close - lag(close),
+         arithmetic_return = price_change / lag(close),
+         log_return        = log(close / lag(close))) %>%
+  
+  # Tidy
+  gather(delta_type, delta, price_change, arithmetic_return, log_return) %>%
+  group_by(delta_type, add = TRUE) %>%
+  
+  # Remove the rows of NAs
+  na.omit() %>%
+  
+  # Calc JQ values
+  summarise(jq_stat = jarque_bera_stat(delta),
+            jq_pval = jarque_bera_pval(delta)) %>%
+  arrange(desc(delta_type))
+```
+
+# 2 - Analytical 99% VaR under normal assumption
+
+```{r}
+# Required for delta/gamma analytical
+d1 <- (log(current_close_aapl / k) + (r - y + sigma^2 / 2) * time_to_expiry) / (sigma * sqrt(time_to_expiry))
+
+# Put delta and gamma
+delta_analytical_aapl <- exp(-y * time_to_expiry) * (pnorm(d1) - 1)
+delta_analytical_aapl
+
+# The SPY analytical delta is just 1 because we aren't dealing with options
+delta_analytical_spy <- 1
+
+moments <- aapl_abs %>%
+  left_join(spy_abs, "date") %>%
+  na.omit() %>%
+  summarise(
+    
+    # Means
+    mu_delta_X_spy   = mean(spy_delta_p),
+    mu_delta_X_aapl  = mean(delta_close),
+    mu_delta_p       = (delta_analytical_spy  * mu_delta_X_spy  * shares_spy) + 
+                       (delta_analytical_aapl * mu_delta_X_aapl * options_appl),
+    
+    # Variances / Covariances
+    var_delta_X_spy  = var(spy_delta_p),
+    var_delta_X_aapl = var(delta_close),
+    cov_delta_X      = cov(spy_delta_p, delta_close),
+    var_delta_p      = (shares_spy   ^ 2 * delta_analytical_spy  ^ 2 * var_delta_X_spy) + 
+                       (options_appl ^ 2 * delta_analytical_aapl ^ 2 * var_delta_X_aapl) + 
+                       (2 * shares_spy * options_appl * delta_analytical_aapl * delta_analytical_spy * cov_delta_X)
+  )
+  
+
+moments %>%
+  mutate(VaR_99 = mu_delta_p + sqrt(var_delta_p) * qnorm(.01)) %>%
+  gather(feature, value)
+```
+
+# 3 - Beginner VaR
+
+```{r}
+set.seed(123)
+
+n_sims <- 5000
+percentile_99_n_sims <- .01 * n_sims
+
+current_portf_value <- shares_spy * current_close_spy + options_appl * current_option_value
+
+cov_mat <- matrix(c(moments$var_delta_X_spy, moments$cov_delta_X,
+                    moments$cov_delta_X,     moments$var_delta_X_aapl),
+                  nrow = 2,
+                  dimnames = list(c("SPY", "AAPL"), c("SPY", "AAPL")))
+
+mean_vec <- matrix(c(moments$mu_delta_X_spy, moments$mu_delta_X_aapl), nrow = 2, dimnames = list(c("SPY", "AAPL")))
+
+chol_fac <- t(chol(cov_mat))
+
+sims <- tibble(
+       sim                     = seq(n_sims),
+       Z                       = replicate(n_sims, rnorm(2) %>% as.matrix(), simplify = FALSE),
+       delta_X                 = map(Z, ~mean_vec + chol_fac %*% .x),
+       shifted_aapl            = map_dbl(delta_X, ~current_close_aapl + .x["AAPL",]),
+       shifted_spy             = map_dbl(delta_X, ~current_close_spy + .x["SPY",]),
+       shifted_aapl_option     = put_option_pricer(shifted_aapl, k , r, y, time_to_expiry, sigma),
+       shifted_portfolio_value = shares_spy * shifted_spy + options_appl * shifted_aapl_option,
+       delta_P                 = shifted_portfolio_value - current_portf_value
+)
+
+sims
+
+sims %>%
+  pull(delta_P) %>%
+  sort() %>%
+  .[percentile_99_n_sims]
+```
+
+# 4 - Barrier VaR
+
+Assuming you also want absolute shifts here.
+
+
+Up and out call formula
+
+```{r}
+up_and_out_call_pricer <- function(s, k, b, r, y, t, sigma) {
+  
+  # This formula will actually calculate a value for the option
+  # if we don't ceiling it at b. When s == b the value is 0. When s > b
+  # the value should also be 0, this ensures that happens.
+  s <- pmin(s, b)
+  
+  # Call option pricer
+  C <- function(s, k) {
+      d1 <- (log(s / k) + (r - y + sigma^2 / 2) * t) / (sigma * sqrt(t))
+      d2 <- d1 - sigma * sqrt(t)
+  
+      s * exp(-y * t) * pnorm(d1) - pnorm(d2) * k * exp(-r * t)
+  }
+  
+  # Digital call option pricer
+  C_d <- function(s, k) {
+    numerator   <- log(s / k) + (r - y - .5 * sigma ^ 2) * t
+    denominator <- sigma * sqrt(t) 
+    
+    exp(- r * t) * pnorm(numerator / denominator)
+  }
+  
+  alpha <- - (r - y - sigma^2 / 2) / (sigma ^ 2)
+  
+  V <- C(s, k) - C(s, b) - (b - k) * C_d(s, b) - 
+      (s / b) ^ (2 * alpha) * ( C(b^2/s, k) - C(b^2/s, b) - (b - k) * C_d(b^2/s, b) )
+  
+  V
+}
+```
+
+VaR Summarizer
+
+```{r}
+summarise_VaR <- function(x) {
+  x %>%
+    summarise(VaR = options_appl * sort(delta_p)[percentile_99])
+}
+```
+
+
+```{r}
+b <- 183
+current_up_and_out_call_aapl <- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+current_up_and_out_call_aapl
+```
+
+# 4a - Full reeval
+
+```{r}
+calculate_full_reeval_delta_p <- function(x, b) {
+  x %>%
+    mutate(
+         shifted_current_close = current_close_aapl + delta_close,
+         shifted_option_value  = up_and_out_call_pricer(shifted_current_close, k, b, r, y, time_to_expiry, sigma),
+         delta_p               = shifted_option_value - current_up_and_out_call_aapl)
+}
+
+aapl_abs_full_reeval <- calculate_full_reeval_delta_p(aapl_abs, b)
+
+select(aapl_abs_full_reeval, -close, -delta_close)
+```
+
+```{r}
+summarise_VaR(aapl_abs_full_reeval)
+```
+
+# 4b- DG approx, numerical, absolute shifts
+
+```{r}
+calculate_DG_numerical_VaR_delta_P <- function(x, b) {
+  x %>%
+  na.omit() %>%
+  mutate(
+
+    # Calculate h for absolute
+    h                = sqrt(var(delta_close) + mean(delta_close) ^ 2),
+
+    # Recalculate the put options with a shock upward
+    shift_up_close   = up_and_out_call_pricer(current_close_aapl + h, k, b, r, y, time_to_expiry, sigma),
+
+    # Recalculate the put options with a shock downward
+    shift_down_close = up_and_out_call_pricer(current_close_aapl - h, k, b, r, y, time_to_expiry, sigma),
+
+    # This is P in the formula, used by gamma
+    no_shift_close   = up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma),
+
+    # Approximate delta
+    delta_numerical  = (shift_up_close - shift_down_close) / (2 * h),
+
+    # Approximate gamma
+    gamma_numerical  = (shift_up_close - 2 * no_shift_close + shift_down_close) / (h^2),
+
+    # Calculate delta_p from numerical delta/gamma
+    delta_p          = delta_numerical * delta_close + 1/2 * gamma_numerical * delta_close ^ 2
+  )
+}
+
+aapl_abs_dg_numerical <- calculate_DG_numerical_VaR_delta_P(aapl_abs, b)
+aapl_abs_dg_numerical
+```
+
+```{r}
+aapl_abs_dg_numerical %>%
+  summarise_VaR()
+```
+
+
+# 4c - Grid, absolute shifts
+
+```{r}
+
+calculate_grid_VaR_delta_p <- function(x, b) {
+  
+  grid_multipliers <- c(.6, .7, .8, .9, .95, .99, 1, 1.01, 1.05, 1.1, 1.2, 1.3, 1.4)
+  grid_prices      <- grid_multipliers * current_close_aapl
+  grid_options     <- up_and_out_call_pricer(grid_prices, k, b, r, y, time_to_expiry, sigma)
+  
+  x %>%
+    na.omit() %>%
+    mutate(
+      shifted_current_close       = delta_close + current_close_aapl,
+      approx_shifted_option_value = approx(x = grid_prices, y = grid_options, xout = shifted_current_close)$y,
+      delta_p                     = approx_shifted_option_value - current_up_and_out_call_aapl
+    ) 
+}
+
+aapl_abs_grid <- calculate_grid_VaR_delta_p(aapl_abs, b)
+```
+
+
+```{r}
+summarise_VaR(aapl_abs_grid)
+```
+
+## Summary
+
+When the barrier is 183, the DG and Grid method both perform fine.
+
+```{r}
+plot_ecdf(aapl_abs_full_reeval, aapl_abs_dg_numerical, aapl_abs_grid)
+```
+
+## Shifting the barrier around
+
+That being said, moving the barrier price around (especially by bringing it closer to the current price)
+results in both approximations failing in their own unique way.
+
+The moving image below is the ECDF of the delta_p values. Essentially, this 
+has sorted the values and plotted them on the x axis, with the y axis being
+the cumulative probability. The VaR for each approximation is the corresponding
+vertical line.
+
+You can see how as the barrier get's above the 
+current stock price of 175, the Delta Gamma approximation first fails by 
+overshooting the required VaR. Then, as the barrier is increased further, the
+full reevaluation and the DG method begin to coincide again, but the Grid
+approximation lags behind and underestimates the VaR. As the barrier increases 
+above 183.5 or so, all three methods again give the same answer for VaR.
+
+```{r include=FALSE}
+library(gganimate)
+
+b_vals <- seq(174, 185, by = .2)
+
+b_reevals <- map(b_vals, ~{
+    b <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_full_reeval_delta_p(aapl_abs, b) %>%
+    mutate(b = paste("b =", as.character(b)))
+}) %>%
+  bind_rows()
+
+b_dg <- map(b_vals, ~{
+    b <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_DG_numerical_VaR_delta_P(aapl_abs, b) %>%
+    mutate(b = paste("b =", as.character(b)))
+}) %>%
+  bind_rows()
+
+b_grid <- map(b_vals, ~{
+    b <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_grid_VaR_delta_p(aapl_abs, b) %>%
+    mutate(b = paste("b =", as.character(b)))
+}) %>%
+  bind_rows()
+
+plot_ecdf_framed <- function(full_reeval, dg_numerical, grid) {
+
+  full_reeval  <- rename(full_reeval, full_reeval = delta_p) %>% select(date, full_reeval, b)
+  dg_numerical <- rename(dg_numerical, dg_numerical = delta_p) %>% select(date, dg_numerical, b)
+  grid         <- rename(grid, grid = delta_p) %>% select(date, grid, b)
+  
+  left_join(left_join(full_reeval, dg_numerical, by = c("b", "date")), grid, c("b", "date")) %>%
+    gather(EvaluationType, delta_p, -date, -b) %>%
+    group_by(b, EvaluationType) %>% 
+    mutate(VaR = sort(delta_p)[percentile_99]) %>%
+    ggplot(aes(x = delta_p, color = EvaluationType, frame = b)) +
+    stat_ecdf(geom = "step", size = .8, alpha = .7) +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(aes(xintercept = VaR, color = EvaluationType, frame = b)) +
+    theme_minimal() +
+    coord_cartesian(xlim = c(-.02, .02))
+}
+
+animation::ani.options(ani.dev = "png", ani.type = "png", ani.width = 800, ani.height = 800, interval = .75)
+moving_ecdf <- plot_ecdf_framed(b_reevals, b_dg, b_grid)
+gganimate(moving_ecdf, filename = "hw2-moving-ecdf-thin.gif")
+```
+
+![](hw2-moving-ecdf-thin.gif)
+
+
+## Shifting the current price around, keeping b = 183
+
+```{r}
+
+b <- 183
+current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+
+current_close_aapl_range <- seq(170, 190, .05)
+
+cp_aapl_reevals <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_full_reeval_delta_p(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    select(date, delta_p, current_apple)
+}) %>%
+  bind_rows()
+
+cp_aapl_dg <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_DG_numerical_VaR_delta_P(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    select(date, delta_p, current_apple)
+}) %>%
+  bind_rows()
+
+cp_aapl_grid <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_grid_VaR_delta_p(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    select(date, delta_p, current_apple)
+}) %>% 
+  bind_rows()
+
+all_var <- bind_rows(list(full_reeval = cp_aapl_reevals, dg = cp_aapl_dg, grid = cp_aapl_grid), .id = "VaR_type")
+
+all_var %>%
+  group_by(VaR_type, current_apple) %>%
+  slice(503) %>%
+  ggplot(aes(x = current_apple, y = delta_p, color = VaR_type)) +
+  geom_line() +
+  geom_vline(xintercept = 175)a
+```
+
+```{r}
+
+b <- 183
+current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+
+current_close_aapl_range <- seq(170, 190, .05)
+
+cp_aapl_reevals <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_full_reeval_delta_p(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    group_by(current_apple) %>%
+    summarise_VaR()
+}) %>%
+  bind_rows()
+
+cp_aapl_dg <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_DG_numerical_VaR_delta_P(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    group_by(current_apple) %>%
+    summarise_VaR()
+}) %>%
+  bind_rows()
+
+cp_aapl_grid <-  map(current_close_aapl_range, ~{
+  current_close_aapl <<- .x
+  current_up_and_out_call_aapl <<- up_and_out_call_pricer(current_close_aapl, k, b, r, y, time_to_expiry, sigma)
+  calculate_grid_VaR_delta_p(aapl_abs, b) %>%
+    mutate(current_apple = .x) %>%
+    group_by(current_apple) %>%
+    summarise_VaR()
+}) %>%
+  bind_rows()
+
+all_var <- bind_rows(list(full_reeval = cp_aapl_reevals, dg = cp_aapl_dg, grid = cp_aapl_grid), .id = "VaR_type")
+
+all_var %>%
+  ggplot(aes(x = current_apple, y = VaR, color = VaR_type)) +
+  geom_line() +
+  geom_vline(xintercept = 175)
+```
+
